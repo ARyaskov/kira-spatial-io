@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+//! Parquet barcode-mapping to spatial-domain construction.
+
 use std::collections::HashMap;
 use std::path::Path;
 

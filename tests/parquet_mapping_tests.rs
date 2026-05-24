@@ -45,8 +45,7 @@ fn parquet_mapping_respects_low_memory_budget() {
         &root,
         LoadConfig {
             memory_budget_mb: 0,
-            bin_level: None,
-            validate_strict: true,
+            ..LoadConfig::default()
         },
     )
     .expect_err("should fail with tiny budget");

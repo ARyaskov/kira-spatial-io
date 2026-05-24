@@ -1,5 +1,8 @@
+use std::path::{Path, PathBuf};
+
 /// Error type for deterministic IO, validation, and format handling.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum SpatialIoError {
     /// Dimensional or shape mismatch between linked arrays/sections.
     #[error("dimension mismatch: {0}")]
@@ -22,7 +25,51 @@ pub enum SpatialIoError {
     /// Unsupported input layout or binary format condition.
     #[error("unsupported format: {0}")]
     UnsupportedFormat(String),
-    /// Underlying IO failure.
+    /// Per-section CRC32C check failed (file corruption).
+    #[error("CRC mismatch in section {section_id}: expected {expected:#010x}, got {actual:#010x}")]
+    CrcMismatch {
+        /// Section identifier.
+        section_id: u16,
+        /// Expected CRC32C from the section table.
+        expected: u32,
+        /// Actual CRC32C computed from on-disk bytes.
+        actual: u32,
+    },
+    /// Dataset hash mismatch (file corruption or tampering).
+    #[error("dataset hash mismatch")]
+    HashMismatch,
+    /// IO failure with file path context.
+    #[error("io error on {path}: {source}")]
+    IoAt {
+        /// Path involved in the failed operation.
+        path: PathBuf,
+        /// Underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Underlying IO failure without path context.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl SpatialIoError {
+    /// Wraps an `io::Error` with the path that caused it.
+    pub fn io_at(path: impl AsRef<Path>, source: std::io::Error) -> Self {
+        Self::IoAt {
+            path: path.as_ref().to_path_buf(),
+            source,
+        }
+    }
+}
+
+/// Extension trait to ergonomically attach a path to an `io::Result`.
+pub trait IoPathExt<T> {
+    /// Maps the error variant to [`SpatialIoError::IoAt`].
+    fn io_path(self, path: impl AsRef<Path>) -> Result<T, SpatialIoError>;
+}
+
+impl<T> IoPathExt<T> for std::io::Result<T> {
+    fn io_path(self, path: impl AsRef<Path>) -> Result<T, SpatialIoError> {
+        self.map_err(|e| SpatialIoError::io_at(path, e))
+    }
 }

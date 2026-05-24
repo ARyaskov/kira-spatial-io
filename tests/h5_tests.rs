@@ -1,3 +1,5 @@
+#![cfg(feature = "hdf5")]
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +28,7 @@ fn open_h5_loads_tiny_10x_layout() {
     assert_eq!(ds.metadata_core().n_genes, 2);
     assert_eq!(ds.expression_csr().n_bins, 2);
     assert_eq!(ds.expression_csr().n_genes, 2);
-    assert_eq!(ds.expression_csr().indptr, vec![0, 1, 3]);
+    assert_eq!(ds.expression_csr().indptr.to_u64_vec(), vec![0, 1, 3]);
     assert_eq!(ds.expression_csr().indices, vec![0, 0, 1]);
     assert_eq!(ds.expression_csr().data, vec![4.0, 1.0, 7.0]);
 
@@ -72,15 +74,13 @@ fn open_h5_respects_low_memory_budget() {
         &root,
         LoadConfig {
             memory_budget_mb: 0,
-            bin_level: None,
-            validate_strict: true,
+            ..LoadConfig::default()
         },
     )
     .expect_err("must fail with low budget");
     assert!(
         err.to_string().contains("memory limit exceeded"),
-        "actual error: {}",
-        err
+        "actual error: {err}"
     );
 
     fs::remove_dir_all(&root).expect("cleanup");

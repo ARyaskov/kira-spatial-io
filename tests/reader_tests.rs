@@ -43,8 +43,8 @@ fn writer_reader_roundtrip_preserves_dataset_content() {
     );
 
     assert_eq!(
-        loaded.expression_csr().indptr,
-        source.expression_csr().indptr
+        loaded.expression_csr().indptr.to_u64_vec(),
+        source.expression_csr().indptr.to_u64_vec()
     );
     assert_eq!(
         loaded.expression_csr().indices,
@@ -69,9 +69,15 @@ fn writer_reader_roundtrip_preserves_dataset_content() {
         .zip(source.features().rows.iter())
     {
         assert_eq!(a.gene_id, b.gene_id);
+        assert_eq!(a.feature_id, b.feature_id, "feature_id (Ensembl) preserved");
         assert_eq!(a.gene_name, b.gene_name);
         assert_eq!(a.feature_type, b.feature_type);
     }
+
+    // The feature_id column (column 0 of features.tsv) must round-trip.
+    // Fixture features in canonical (sorted-by-gene_name) order are gene_a -> GeneA, gene_b -> GeneB.
+    assert_eq!(loaded.features().rows[0].feature_id, "gene_a");
+    assert_eq!(loaded.features().rows[1].feature_id, "gene_b");
 
     assert_eq!(loaded.metadata_json(), source.metadata_json());
     assert_eq!(
@@ -120,7 +126,8 @@ fn reader_rejects_corrupted_magic_and_version() {
     assert!(err.to_string().contains("invalid magic"));
 
     let mut bytes2 = fs::read(&out).expect("read bytes2");
-    bytes2[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    // Set a definitely-unknown version.
+    bytes2[8..10].copy_from_slice(&99_u16.to_le_bytes());
     let bad_version = root.join("bad_version.kira-spatial.bin");
     fs::write(&bad_version, &bytes2).expect("write bad version");
     let err = Dataset::from_kira_bin(&bad_version).expect_err("must fail version");
@@ -136,21 +143,75 @@ fn reader_rejects_section_alignment_and_hash_mismatch() {
     let out = root.join("sample.kira-spatial.bin");
     source.export_kira_bin(&out).expect("export");
 
+    // v2 section entry layout:
+    //   0..2   id, 2..4   flags, 4..12  offset, 12..20 length, 20..24 crc32
     let mut bytes = fs::read(&out).expect("read bytes");
-    let first_entry_offset_field = HEADER_SIZE as usize + 2;
-    bytes[first_entry_offset_field..first_entry_offset_field + 8]
+    let entry0_offset_field = HEADER_SIZE as usize + 4;
+    bytes[entry0_offset_field..entry0_offset_field + 8]
         .copy_from_slice(&65_u64.to_le_bytes());
     let bad_align = root.join("bad_align.kira-spatial.bin");
     fs::write(&bad_align, &bytes).expect("write bad align");
     let err = Dataset::from_kira_bin(&bad_align).expect_err("must fail alignment");
     assert!(err.to_string().contains("not 64-byte aligned"));
 
+    // Hash field in v2 header is at bytes 16..32.
     let mut bytes2 = fs::read(&out).expect("read bytes2");
-    bytes2[13] ^= 0xFF;
+    bytes2[16] ^= 0xFF;
     let bad_hash = root.join("bad_hash.kira-spatial.bin");
     fs::write(&bad_hash, &bytes2).expect("write bad hash");
     let err = Dataset::from_kira_bin(&bad_hash).expect_err("must fail hash");
     assert!(err.to_string().contains("dataset hash mismatch"));
+
+    fs::remove_dir_all(&root).expect("cleanup");
+}
+
+#[test]
+fn reader_rejects_section_crc_mismatch() {
+    let root = prepare_fixture("reader_corrupt_section_crc");
+    let source = Dataset::open_10x(&root, LoadConfig::default()).expect("open source");
+    let out = root.join("sample.kira-spatial.bin");
+    source.export_kira_bin(&out).expect("export");
+
+    let mut bytes = fs::read(&out).expect("read bytes");
+    // Section table starts at HEADER_SIZE; first entry id/flags/offset/length/crc occupy
+    // bytes 64..88. Read the first section's offset and length, then flip a byte inside
+    // its payload — that should trigger a per-section CRC mismatch.
+    let offset = {
+        let mut arr = [0_u8; 8];
+        arr.copy_from_slice(&bytes[HEADER_SIZE as usize + 4..HEADER_SIZE as usize + 12]);
+        u64::from_le_bytes(arr) as usize
+    };
+    let length = {
+        let mut arr = [0_u8; 8];
+        arr.copy_from_slice(&bytes[HEADER_SIZE as usize + 12..HEADER_SIZE as usize + 20]);
+        u64::from_le_bytes(arr) as usize
+    };
+    assert!(length > 0);
+    let target = offset + length / 2;
+    bytes[target] ^= 0xAA;
+
+    let bad_crc = root.join("bad_crc.kira-spatial.bin");
+    fs::write(&bad_crc, &bytes).expect("write bad crc");
+    let err = Dataset::from_kira_bin(&bad_crc).expect_err("must fail crc");
+    assert!(err.to_string().contains("CRC mismatch"));
+
+    fs::remove_dir_all(&root).expect("cleanup");
+}
+
+#[test]
+fn reader_rejects_oversized_file_against_budget() {
+    let root = prepare_fixture("reader_budget");
+    let source = Dataset::open_10x(&root, LoadConfig::default()).expect("open source");
+    let out = root.join("sample.kira-spatial.bin");
+    source.export_kira_bin(&out).expect("export");
+
+    // Set the budget below the file size to verify the early file-size guard.
+    let tiny_cfg = LoadConfig {
+        memory_budget_mb: 0,
+        ..LoadConfig::default()
+    };
+    let err = Dataset::from_kira_bin_with(&out, &tiny_cfg).expect_err("must fail budget");
+    assert!(err.to_string().contains("memory budget") || err.to_string().contains("memory limit"));
 
     fs::remove_dir_all(&root).expect("cleanup");
 }

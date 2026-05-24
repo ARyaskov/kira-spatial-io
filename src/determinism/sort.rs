@@ -39,13 +39,33 @@ pub fn sort_bins(domain: &mut SpatialDomain) -> Result<SortBinsResult, SpatialIo
     let mut perm: Vec<usize> = (0..n).collect();
 
     if let (Some(row), Some(col)) = (&domain.grid_row, &domain.grid_col) {
-        perm.sort_unstable_by_key(|&i| (row[i], col[i]));
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::slice::ParallelSliceMut;
+            perm.par_sort_unstable_by_key(|&i| (row[i], col[i]));
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            perm.sort_unstable_by_key(|&i| (row[i], col[i]));
+        }
     } else {
-        perm.sort_unstable_by(|&a, &b| {
-            domain.y[a]
-                .total_cmp(&domain.y[b])
-                .then_with(|| domain.x[a].total_cmp(&domain.x[b]))
-        });
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::slice::ParallelSliceMut;
+            perm.par_sort_unstable_by(|&a, &b| {
+                domain.y[a]
+                    .total_cmp(&domain.y[b])
+                    .then_with(|| domain.x[a].total_cmp(&domain.x[b]))
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            perm.sort_unstable_by(|&a, &b| {
+                domain.y[a]
+                    .total_cmp(&domain.y[b])
+                    .then_with(|| domain.x[a].total_cmp(&domain.x[b]))
+            });
+        }
     }
 
     let mut old_to_new = vec![0_u32; n];
@@ -70,13 +90,15 @@ pub fn sort_bins(domain: &mut SpatialDomain) -> Result<SortBinsResult, SpatialIo
 }
 
 fn permute_vec<T: Copy>(data: &[T], perm: &[usize]) -> Vec<T> {
-    perm.iter().map(|&i| data[i]).collect()
+    let mut out = Vec::with_capacity(perm.len());
+    out.extend(perm.iter().map(|&i| data[i]));
+    out
 }
 
 fn permute_bitvec(data: &BitVec, perm: &[usize]) -> BitVec {
-    let mut out = BitVec::with_capacity(data.len());
-    for &i in perm {
-        out.push(data[i]);
+    let mut out: BitVec = BitVec::repeat(false, perm.len());
+    for (new_idx, &old_idx) in perm.iter().enumerate() {
+        out.set(new_idx, *data.get(old_idx).expect("perm index in range"));
     }
     out
 }

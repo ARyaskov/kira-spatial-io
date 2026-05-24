@@ -1,5 +1,6 @@
 /// Optional barcode mapping row used for HD metadata enrichment.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BarcodeMappingRow {
     /// Barcode string.
     pub barcode: String,
@@ -17,6 +18,7 @@ pub struct BarcodeMappingRow {
 
 /// Deterministically sorted barcode mapping table.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BarcodeMappingTable {
     /// Mapping rows.
     pub rows: Vec<BarcodeMappingRow>,

@@ -1,5 +1,8 @@
+//! Canonical dataset hash (leading 16 bytes of BLAKE3 over canonical section streams).
+
 use blake3::Hasher;
 
+use crate::binary::bitmask::tissue_mask_to_u64_words;
 use crate::binary::format::{
     SECTION_ID_CSR, SECTION_ID_FEATURE_TABLE, SECTION_ID_META_CORE, SECTION_ID_META_JSON,
     SECTION_ID_SPATIAL_DOMAIN,
@@ -10,14 +13,17 @@ use crate::model::{
     spatial_domain::SpatialDomain,
 };
 
-/// Computes canonical dataset hash (BLAKE3-128) from normalized payloads.
+/// Length of the canonical dataset hash in bytes.
+pub const DATASET_HASH_BYTES: usize = 16;
+
+/// Computes the canonical dataset hash from normalized payloads.
 pub fn compute_dataset_hash(
     spatial: &SpatialDomain,
     csr: &BinsCsr,
     features: &FeatureTable,
     meta: &DatasetMetaCore,
     canonical_json_bytes: &[u8],
-) -> Result<[u8; 16], SpatialIoError> {
+) -> Result<[u8; DATASET_HASH_BYTES], SpatialIoError> {
     let mut hasher = Hasher::new();
 
     hash_u16(&mut hasher, SECTION_ID_SPATIAL_DOMAIN);
@@ -30,15 +36,15 @@ pub fn compute_dataset_hash(
     hash_feature_table(&mut hasher, features)?;
 
     hash_u16(&mut hasher, SECTION_ID_META_CORE);
-    hash_metadata_core_excluding_hash(&mut hasher, meta)?;
+    hash_metadata_core(&mut hasher, meta)?;
 
     hash_u16(&mut hasher, SECTION_ID_META_JSON);
     hash_u64(&mut hasher, canonical_json_bytes.len() as u64);
     hasher.update(canonical_json_bytes);
 
     let full = hasher.finalize();
-    let mut out = [0_u8; 16];
-    out.copy_from_slice(&full.as_bytes()[..16]);
+    let mut out = [0_u8; DATASET_HASH_BYTES];
+    out.copy_from_slice(&full.as_bytes()[..DATASET_HASH_BYTES]);
     Ok(out)
 }
 
@@ -75,32 +81,20 @@ fn hash_spatial_domain(hasher: &mut Hasher, domain: &SpatialDomain) -> Result<()
     hash_u8(hasher, domain.bin_level);
     hash_u16(hasher, if has_grid { 1 } else { 0 });
 
-    for &v in &domain.x {
-        hash_f32(hasher, v);
-    }
-    for &v in &domain.y {
-        hash_f32(hasher, v);
-    }
+    hasher.update(bytemuck::cast_slice(&domain.x));
+    hasher.update(bytemuck::cast_slice(&domain.y));
 
     if let (Some(rows), Some(cols)) = (&domain.grid_row, &domain.grid_col) {
-        for &v in rows {
-            hash_u32(hasher, v);
-        }
-        for &v in cols {
-            hash_u32(hasher, v);
-        }
+        hasher.update(bytemuck::cast_slice(rows));
+        hasher.update(bytemuck::cast_slice(cols));
     }
 
-    for &v in &domain.bin_id {
-        hash_u32(hasher, v);
-    }
+    hasher.update(bytemuck::cast_slice(&domain.bin_id));
 
-    let raw = domain.tissue_mask.as_raw_slice();
+    let words = tissue_mask_to_u64_words(&domain.tissue_mask);
     hash_u64(hasher, domain.tissue_mask.len() as u64);
-    hash_u64(hasher, std::mem::size_of_val(raw) as u64);
-    for word in raw {
-        hasher.update(&word.to_le_bytes());
-    }
+    hash_u64(hasher, (words.len() * 8) as u64);
+    hasher.update(bytemuck::cast_slice(&words));
 
     Ok(())
 }
@@ -111,7 +105,7 @@ fn hash_csr(hasher: &mut Hasher, csr: &BinsCsr) -> Result<(), SpatialIoError> {
             "indptr length does not match n_bins + 1".to_string(),
         ));
     }
-    if csr.indptr.last().copied().unwrap_or(1) != csr.nnz {
+    if csr.indptr.last().unwrap_or(1) != csr.nnz {
         return Err(SpatialIoError::InvalidCsr(
             "indptr[last] does not match nnz".to_string(),
         ));
@@ -127,15 +121,10 @@ fn hash_csr(hasher: &mut Hasher, csr: &BinsCsr) -> Result<(), SpatialIoError> {
     hash_u64(hasher, csr.nnz);
     hash_u8(hasher, u8::from(csr.normalized));
 
-    for &v in &csr.indptr {
-        hash_u64(hasher, v);
-    }
-    for &v in &csr.indices {
-        hash_u32(hasher, v);
-    }
-    for &v in &csr.data {
-        hash_f32(hasher, v);
-    }
+    let indptr_u64 = csr.indptr.to_u64_vec();
+    hasher.update(bytemuck::cast_slice(&indptr_u64));
+    hasher.update(bytemuck::cast_slice(&csr.indices));
+    hasher.update(bytemuck::cast_slice(&csr.data));
 
     Ok(())
 }
@@ -149,16 +138,14 @@ fn hash_feature_table(hasher: &mut Hasher, table: &FeatureTable) -> Result<(), S
             )));
         }
         hash_u32(hasher, row.gene_id);
+        hash_len_prefixed_str(hasher, &row.feature_id)?;
         hash_len_prefixed_str(hasher, &row.gene_name)?;
         hash_len_prefixed_str(hasher, &row.feature_type)?;
     }
     Ok(())
 }
 
-fn hash_metadata_core_excluding_hash(
-    hasher: &mut Hasher,
-    meta: &DatasetMetaCore,
-) -> Result<(), SpatialIoError> {
+fn hash_metadata_core(hasher: &mut Hasher, meta: &DatasetMetaCore) -> Result<(), SpatialIoError> {
     hash_len_prefixed_str(hasher, &meta.dataset_name)?;
     hash_len_prefixed_str(hasher, &meta.source_format)?;
     hash_u8(hasher, meta.bin_level);
@@ -200,9 +187,5 @@ fn hash_u32(hasher: &mut Hasher, v: u32) {
 }
 
 fn hash_u64(hasher: &mut Hasher, v: u64) {
-    hasher.update(&v.to_le_bytes());
-}
-
-fn hash_f32(hasher: &mut Hasher, v: f32) {
     hasher.update(&v.to_le_bytes());
 }

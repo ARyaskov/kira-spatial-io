@@ -1,11 +1,13 @@
+//! Reader for Visium `tissue_positions[_list].csv`.
+
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 
 use bitvec::vec::BitVec;
-use csv::ReaderBuilder;
 
 use crate::config::LoadConfig;
-use crate::error::SpatialIoError;
+use crate::error::{IoPathExt, SpatialIoError};
 use crate::input::util::open_text_maybe_gz;
 use crate::model::coord::CoordSystem;
 use crate::model::spatial_domain::SpatialDomain;
@@ -29,21 +31,29 @@ pub fn load_spatial_domain(
     let mut seen = vec![false; n];
 
     let reader = open_text_maybe_gz(csv_path)?;
-    let mut csv = ReaderBuilder::new().has_headers(false).from_reader(reader);
-
     let mut first_record = true;
-    for result in csv.records() {
-        let record = result.map_err(|e| {
-            SpatialIoError::UnsupportedFormat(format!("invalid spatial csv record: {e}"))
-        })?;
-
-        if record.len() < 6 {
-            return Err(SpatialIoError::UnsupportedFormat(
-                "spatial csv row has fewer than 6 columns".to_string(),
-            ));
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = line.io_path(csv_path)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
         }
 
-        let barcode = record.get(0).unwrap_or_default();
+        let mut cols = trimmed.split(',');
+        let barcode = cols.next().unwrap_or("");
+        let c1 = cols.next().unwrap_or("");
+        let c2 = cols.next().unwrap_or("");
+        let c3 = cols.next().unwrap_or("");
+        let c4 = cols.next().unwrap_or("");
+        let c5 = cols.next().unwrap_or("");
+        if c5.is_empty() {
+            return Err(SpatialIoError::UnsupportedFormat(format!(
+                "{}: row {} has fewer than 6 columns",
+                csv_path.display(),
+                lineno + 1
+            )));
+        }
+
         if first_record {
             first_record = false;
             if barcode == "barcode" {
@@ -51,16 +61,17 @@ pub fn load_spatial_domain(
             }
         }
 
-        let in_tissue = parse_u8(record.get(1).unwrap_or_default(), "in_tissue")?;
-        let array_row = parse_u32(record.get(2).unwrap_or_default(), "array_row")?;
-        let array_col = parse_u32(record.get(3).unwrap_or_default(), "array_col")?;
-        let pxl_row = parse_f32(record.get(4).unwrap_or_default(), "pxl_row_in_fullres")?;
-        let pxl_col = parse_f32(record.get(5).unwrap_or_default(), "pxl_col_in_fullres")?;
+        let in_tissue = parse_u8(c1, "in_tissue", csv_path, lineno)?;
+        let array_row = parse_u32(c2, "array_row", csv_path, lineno)?;
+        let array_col = parse_u32(c3, "array_col", csv_path, lineno)?;
+        let pxl_row = parse_f32(c4, "pxl_row_in_fullres", csv_path, lineno)?;
+        let pxl_col = parse_f32(c5, "pxl_col_in_fullres", csv_path, lineno)?;
 
         let Some(&idx) = barcode_to_idx.get(barcode) else {
             if cfg.validate_strict {
                 return Err(SpatialIoError::DimensionMismatch(format!(
-                    "barcode in spatial not in barcodes: {barcode}"
+                    "{}: barcode in spatial not in barcodes: {barcode}",
+                    csv_path.display()
                 )));
             }
             continue;
@@ -96,20 +107,47 @@ pub fn load_spatial_domain(
     )
 }
 
-fn parse_u8(s: &str, field: &str) -> Result<u8, SpatialIoError> {
+fn parse_u8(
+    s: &str,
+    field: &str,
+    path: &Path,
+    lineno: usize,
+) -> Result<u8, SpatialIoError> {
     s.parse::<u8>().map_err(|_| {
-        SpatialIoError::UnsupportedFormat(format!("invalid {field} value in spatial csv: {s}"))
+        SpatialIoError::UnsupportedFormat(format!(
+            "{}: invalid {field} at line {}: {s}",
+            path.display(),
+            lineno + 1
+        ))
     })
 }
 
-fn parse_u32(s: &str, field: &str) -> Result<u32, SpatialIoError> {
+fn parse_u32(
+    s: &str,
+    field: &str,
+    path: &Path,
+    lineno: usize,
+) -> Result<u32, SpatialIoError> {
     s.parse::<u32>().map_err(|_| {
-        SpatialIoError::UnsupportedFormat(format!("invalid {field} value in spatial csv: {s}"))
+        SpatialIoError::UnsupportedFormat(format!(
+            "{}: invalid {field} at line {}: {s}",
+            path.display(),
+            lineno + 1
+        ))
     })
 }
 
-fn parse_f32(s: &str, field: &str) -> Result<f32, SpatialIoError> {
+fn parse_f32(
+    s: &str,
+    field: &str,
+    path: &Path,
+    lineno: usize,
+) -> Result<f32, SpatialIoError> {
     s.parse::<f32>().map_err(|_| {
-        SpatialIoError::UnsupportedFormat(format!("invalid {field} value in spatial csv: {s}"))
+        SpatialIoError::UnsupportedFormat(format!(
+            "{}: invalid {field} at line {}: {s}",
+            path.display(),
+            lineno + 1
+        ))
     })
 }

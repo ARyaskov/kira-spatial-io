@@ -1,12 +1,14 @@
+//! MatrixMarket ingestion to canonical CSR with two passes over the input.
+
 use std::io::BufRead;
 use std::mem::size_of;
 use std::path::Path;
 
-use crate::config::LoadConfig;
+use crate::config::{DuplicatePolicy, LoadConfig};
 use crate::determinism::float::ensure_f32_finite_nonneg;
-use crate::error::SpatialIoError;
+use crate::error::{IoPathExt, SpatialIoError};
 use crate::input::util::open_text_maybe_gz;
-use crate::model::csr::BinsCsr;
+use crate::model::csr::{BinsCsr, Indptr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MtxStream {
@@ -20,13 +22,6 @@ struct MtxTriplet {
     row0: u32,
     col0: u32,
     val: f32,
-}
-
-pub(crate) fn read_mtx_triplets<R: BufRead>(
-    r: R,
-    cfg: &LoadConfig,
-) -> Result<MtxStream, SpatialIoError> {
-    stream_mtx_triplets(r, cfg, |_t| Ok(()))
 }
 
 pub(crate) fn ensure_budget(
@@ -59,58 +54,57 @@ pub(crate) fn build_csr_from_mtx_path(
     let n_bins = old_to_new_bins.len();
     let n_genes = feat_old_to_new.len();
 
-    let first_pass_stream = read_mtx_triplets(open_text_maybe_gz(matrix_path)?, cfg)?;
-    validate_header_dims(first_pass_stream, n_genes, n_bins)?;
+    let mut counts = vec![0_u32; n_bins];
+    let header_a = {
+        let reader = open_text_maybe_gz(matrix_path)?;
+        stream_mtx_triplets(reader, matrix_path, |triplet| {
+            let barcode_old = triplet.col0 as usize;
+            let bin_new = *old_to_new_bins.get(barcode_old).ok_or_else(|| {
+                SpatialIoError::DimensionMismatch(format!(
+                    "barcode index out of range for mapping: {barcode_old}"
+                ))
+            })? as usize;
 
-    let final_bytes_upper = csr_bytes(n_bins, first_pass_stream.nnz)?;
+            let gene_old = triplet.row0 as usize;
+            let gene_new = *feat_old_to_new.get(gene_old).ok_or_else(|| {
+                SpatialIoError::DimensionMismatch(format!(
+                    "feature index out of range for mapping: {gene_old}"
+                ))
+            })?;
+            if gene_new as usize >= n_genes {
+                return Err(SpatialIoError::InvalidCsr(format!(
+                    "gene_id out of range after remap: {gene_new}"
+                )));
+            }
+
+            counts[bin_new] = counts[bin_new]
+                .checked_add(1)
+                .ok_or_else(|| {
+                    SpatialIoError::InvalidCsr("row nnz count overflow while building CSR".to_string())
+                })?;
+            Ok(())
+        })?
+    };
+    validate_header_dims(header_a, n_genes, n_bins)?;
+
+    let final_bytes_upper = csr_bytes(n_bins, header_a.nnz)?;
     ensure_budget(
         final_bytes_upper,
         cfg,
         "final CSR would exceed budget (upper bound)",
     )?;
 
-    let mut counts = vec![0_u32; n_bins];
-    stream_mtx_triplets(open_text_maybe_gz(matrix_path)?, cfg, |triplet| {
-        let barcode_old = triplet.col0 as usize;
-        let Some(&bin_new) = old_to_new_bins.get(barcode_old) else {
-            return Err(SpatialIoError::DimensionMismatch(format!(
-                "barcode index out of range for mapping: {}",
-                barcode_old
-            )));
-        };
-        let bin_new = bin_new as usize;
-
-        let gene_old = triplet.row0 as usize;
-        let Some(&gene_new) = feat_old_to_new.get(gene_old) else {
-            return Err(SpatialIoError::DimensionMismatch(format!(
-                "feature index out of range for mapping: {}",
-                gene_old
-            )));
-        };
-        if gene_new as usize >= n_genes {
-            return Err(SpatialIoError::InvalidCsr(format!(
-                "gene_id out of range after remap: {}",
-                gene_new
-            )));
-        }
-
-        counts[bin_new] = counts[bin_new].checked_add(1).ok_or_else(|| {
-            SpatialIoError::InvalidCsr("row nnz count overflow while building CSR".to_string())
-        })?;
-        Ok(())
-    })?;
-
-    let mut indptr = Vec::with_capacity(n_bins + 1);
-    indptr.push(0_u64);
+    let mut indptr64 = Vec::with_capacity(n_bins + 1);
+    indptr64.push(0_u64);
     for &count in &counts {
-        let next = indptr
+        let next = indptr64
             .last()
             .copied()
             .and_then(|v| v.checked_add(count as u64))
             .ok_or_else(|| SpatialIoError::InvalidCsr("indptr overflow".to_string()))?;
-        indptr.push(next);
+        indptr64.push(next);
     }
-    let nnz_upper = *indptr
+    let nnz_upper = *indptr64
         .last()
         .ok_or_else(|| SpatialIoError::InvalidCsr("indptr construction failed".to_string()))?;
 
@@ -125,9 +119,12 @@ pub(crate) fn build_csr_from_mtx_path(
     let nnz_upper_usize = usize_from_u64(nnz_upper, "nnz does not fit usize")?;
     let mut indices = vec![0_u32; nnz_upper_usize];
     let mut data = vec![0_f32; nnz_upper_usize];
-    let mut write_ptr = indptr[..n_bins].to_vec();
+    let mut write_ptr = indptr64[..n_bins].to_vec();
+    let mut insertion_order = vec![0_u32; nnz_upper_usize];
+    let mut next_seq: u32 = 0;
 
-    stream_mtx_triplets(open_text_maybe_gz(matrix_path)?, cfg, |triplet| {
+    let reader = open_text_maybe_gz(matrix_path)?;
+    let header_b = stream_mtx_triplets(reader, matrix_path, |triplet| {
         let bin_new = old_to_new_bins[triplet.col0 as usize] as usize;
         let gene_new = feat_old_to_new[triplet.row0 as usize];
 
@@ -145,21 +142,28 @@ pub(crate) fn build_csr_from_mtx_path(
 
         indices[pos] = gene_new;
         data[pos] = triplet.val;
+        insertion_order[pos] = next_seq;
+        next_seq = next_seq.wrapping_add(1);
         Ok(())
     })?;
+    if header_a != header_b {
+        return Err(SpatialIoError::UnsupportedFormat(
+            "matrix.mtx header changed between passes".to_string(),
+        ));
+    }
 
     for i in 0..n_bins {
-        if write_ptr[i] != indptr[i + 1] {
+        if write_ptr[i] != indptr64[i + 1] {
             return Err(SpatialIoError::InvalidCsr(format!(
                 "row write count mismatch for row {i}: {} != {}",
                 write_ptr[i],
-                indptr[i + 1]
+                indptr64[i + 1]
             )));
         }
     }
 
     let max_row_nnz = counts.iter().copied().max().unwrap_or(0) as usize;
-    let row_pairs_tmp = vec_bytes(max_row_nnz, size_of::<(u32, f32)>())?;
+    let row_pairs_tmp = vec_bytes(max_row_nnz, size_of::<(u32, u32, f32)>())?;
     let indptr_tmp = vec_bytes(n_bins + 1, size_of::<u64>())?;
     ensure_peak_within_115(
         final_bytes_upper,
@@ -175,27 +179,35 @@ pub(crate) fn build_csr_from_mtx_path(
     let mut write_cursor: usize = 0;
 
     for row in 0..n_bins {
-        let start = usize_from_u64(indptr[row], "row start offset overflow")?;
-        let end = usize_from_u64(indptr[row + 1], "row end offset overflow")?;
+        let start = usize_from_u64(indptr64[row], "row start offset overflow")?;
+        let end = usize_from_u64(indptr64[row + 1], "row end offset overflow")?;
 
-        let mut pairs: Vec<(u32, f32)> = (start..end).map(|i| (indices[i], data[i])).collect();
-        pairs.sort_unstable_by_key(|(gene_id, _)| *gene_id);
+        let mut pairs: Vec<(u32, u32, f32)> = (start..end)
+            .map(|i| (indices[i], insertion_order[i], data[i]))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
         let mut idx = 0;
         while idx < pairs.len() {
             let gene_id = pairs[idx].0;
             if gene_id as usize >= n_genes {
                 return Err(SpatialIoError::InvalidCsr(format!(
-                    "gene_id out of bounds after sort: {}",
-                    gene_id
+                    "gene_id out of bounds after sort: {gene_id}"
                 )));
             }
 
-            let mut sum = pairs[idx].1;
+            let mut sum = pairs[idx].2;
+            let mut dup_count = 1;
             idx += 1;
             while idx < pairs.len() && pairs[idx].0 == gene_id {
-                sum += pairs[idx].1;
+                sum += pairs[idx].2;
+                dup_count += 1;
                 idx += 1;
+            }
+            if dup_count > 1 && matches!(cfg.duplicate_policy, DuplicatePolicy::Error) {
+                return Err(SpatialIoError::InvalidCsr(format!(
+                    "duplicate (bin,gene)={row},{gene_id} with policy=Error"
+                )));
             }
             ensure_f32_finite_nonneg(sum)?;
 
@@ -211,7 +223,7 @@ pub(crate) fn build_csr_from_mtx_path(
     data.truncate(write_cursor);
 
     let csr = BinsCsr {
-        indptr: indptr2,
+        indptr: Indptr::from_u64(indptr2),
         indices,
         data,
         n_bins: n_bins as u32,
@@ -246,7 +258,7 @@ fn validate_header_dims(
 
 fn stream_mtx_triplets<R, F>(
     mut r: R,
-    _cfg: &LoadConfig,
+    path: &Path,
     mut on_triplet: F,
 ) -> Result<MtxStream, SpatialIoError>
 where
@@ -257,7 +269,7 @@ where
 
     let header = loop {
         line.clear();
-        let n = r.read_line(&mut line)?;
+        let n = r.read_line(&mut line).io_path(path)?;
         if n == 0 {
             return Err(SpatialIoError::UnsupportedFormat(
                 "matrix.mtx missing dimension header".to_string(),
@@ -268,16 +280,15 @@ where
             continue;
         }
 
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() != 3 {
+        let mut parts = trimmed.split_ascii_whitespace();
+        let n_rows = parse_u32(parts.next().unwrap_or_default(), "n_rows")?;
+        let n_cols = parse_u32(parts.next().unwrap_or_default(), "n_cols")?;
+        let nnz = parse_u64(parts.next().unwrap_or_default(), "nnz")?;
+        if parts.next().is_some() {
             return Err(SpatialIoError::UnsupportedFormat(
                 "invalid MatrixMarket dimension line".to_string(),
             ));
         }
-
-        let n_rows = parse_u32(parts[0], "n_rows")?;
-        let n_cols = parse_u32(parts[1], "n_cols")?;
-        let nnz = parse_u64(parts[2], "nnz")?;
         break MtxStream {
             n_rows,
             n_cols,
@@ -288,7 +299,7 @@ where
     let mut seen_triplets: u64 = 0;
     loop {
         line.clear();
-        let n = r.read_line(&mut line)?;
+        let n = r.read_line(&mut line).io_path(path)?;
         if n == 0 {
             break;
         }
@@ -298,16 +309,10 @@ where
             continue;
         }
 
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() < 3 {
-            return Err(SpatialIoError::UnsupportedFormat(
-                "invalid MatrixMarket triplet line".to_string(),
-            ));
-        }
-
-        let row1 = parse_u32(parts[0], "row")?;
-        let col1 = parse_u32(parts[1], "col")?;
-        let val = parse_f32(parts[2], "value")?;
+        let mut parts = trimmed.split_ascii_whitespace();
+        let row1 = parse_u32(parts.next().unwrap_or_default(), "row")?;
+        let col1 = parse_u32(parts.next().unwrap_or_default(), "col")?;
+        let val = parse_f32(parts.next().unwrap_or_default(), "value")?;
         ensure_f32_finite_nonneg(val)?;
 
         if row1 == 0 || col1 == 0 {
@@ -320,21 +325,20 @@ where
         let col0 = col1 - 1;
         if row0 >= header.n_rows || col0 >= header.n_cols {
             return Err(SpatialIoError::DimensionMismatch(format!(
-                "triplet index out of range: row {} col {}",
-                row1, col1
+                "triplet index out of range: row {row1} col {col1}"
             )));
         }
 
         on_triplet(MtxTriplet { row0, col0, val })?;
-        seen_triplets = seen_triplets
-            .checked_add(1)
-            .ok_or_else(|| SpatialIoError::InvalidCsr("nnz counter overflow".to_string()))?;
+        seen_triplets = seen_triplets.checked_add(1).ok_or_else(|| {
+            SpatialIoError::InvalidCsr("nnz counter overflow".to_string())
+        })?;
     }
 
     if seen_triplets != header.nnz {
         return Err(SpatialIoError::InvalidCsr(format!(
-            "nnz mismatch: header {} but parsed {}",
-            header.nnz, seen_triplets
+            "nnz mismatch: header {} but parsed {seen_triplets}",
+            header.nnz
         )));
     }
 
@@ -349,24 +353,22 @@ fn validate_csr_invariants(csr: &BinsCsr) -> Result<(), SpatialIoError> {
         as usize;
     if csr.indptr.len() != expected_indptr_len {
         return Err(SpatialIoError::InvalidCsr(format!(
-            "indptr length {} != n_bins + 1 {}",
+            "indptr length {} != n_bins + 1 {expected_indptr_len}",
             csr.indptr.len(),
-            expected_indptr_len
         )));
     }
 
-    if csr.indptr.first().copied().unwrap_or(1) != 0 {
+    if csr.indptr.first().unwrap_or(1) != 0 {
         return Err(SpatialIoError::InvalidCsr(
             "indptr[0] must be 0".to_string(),
         ));
     }
 
     let nnz = csr.nnz;
-    if csr.indptr.last().copied().unwrap_or(0) != nnz {
+    if csr.indptr.last().unwrap_or(0) != nnz {
         return Err(SpatialIoError::InvalidCsr(format!(
-            "indptr[last] {} != nnz {}",
-            csr.indptr.last().copied().unwrap_or(0),
-            nnz
+            "indptr[last] {} != nnz {nnz}",
+            csr.indptr.last().unwrap_or(0)
         )));
     }
 
@@ -377,8 +379,8 @@ fn validate_csr_invariants(csr: &BinsCsr) -> Result<(), SpatialIoError> {
     }
 
     for row in 0..(csr.n_bins as usize) {
-        let start = csr.indptr[row] as usize;
-        let end = csr.indptr[row + 1] as usize;
+        let start = csr.indptr.get(row) as usize;
+        let end = csr.indptr.get(row + 1) as usize;
         if start > end {
             return Err(SpatialIoError::InvalidCsr(format!(
                 "indptr is not monotonic at row {row}"
@@ -390,8 +392,7 @@ fn validate_csr_invariants(csr: &BinsCsr) -> Result<(), SpatialIoError> {
             let gene = csr.indices[idx];
             if gene >= csr.n_genes {
                 return Err(SpatialIoError::InvalidCsr(format!(
-                    "gene index out of bounds in row {row}: {}",
-                    gene
+                    "gene index out of bounds in row {row}: {gene}"
                 )));
             }
             if let Some(p) = prev

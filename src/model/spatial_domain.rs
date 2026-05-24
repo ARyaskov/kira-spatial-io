@@ -5,6 +5,7 @@ use crate::model::coord::CoordSystem;
 
 /// Canonical spatial domain stored in SoA layout.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SpatialDomain {
     /// X coordinates for each bin.
     pub x: Vec<f32>,
@@ -14,7 +15,7 @@ pub struct SpatialDomain {
     pub grid_row: Option<Vec<u32>>,
     /// Optional grid column coordinates.
     pub grid_col: Option<Vec<u32>>,
-    /// Canonical bin ids after sorting.
+    /// Canonical bin ids after sorting (always `0..n` in canonical order).
     pub bin_id: Vec<u32>,
     /// Tissue membership flags per bin.
     pub tissue_mask: BitVec,

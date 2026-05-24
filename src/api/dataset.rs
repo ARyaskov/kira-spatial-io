@@ -2,10 +2,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::binary::{reader::read_kira_bin, writer::write_kira_bin};
-use crate::config::LoadConfig;
+use crate::binary::reader::{read_kira_bin, read_kira_bin_with};
+use crate::binary::writer::{write_kira_bin, write_kira_bin_with_compression};
+use crate::config::{CompressionPolicy, LoadConfig};
 use crate::error::SpatialIoError;
-use crate::input::{h5::load_h5_dataset, tenx::load_10x_mtx};
+use crate::input::tenx::load_10x_mtx;
+#[cfg(feature = "hdf5")]
+use crate::input::h5::load_h5_dataset;
 #[cfg(feature = "parquet")]
 use crate::model::mapping::BarcodeMappingTable;
 use crate::model::{
@@ -31,18 +34,36 @@ impl Dataset {
     }
 
     /// Opens a 10x H5 matrix layout with required spatial coordinates.
+    #[cfg(feature = "hdf5")]
     pub fn open_h5<P: AsRef<Path>>(path: P, cfg: LoadConfig) -> Result<Self, SpatialIoError> {
         load_h5_dataset(path, cfg)
     }
 
-    /// Loads a previously exported `.kira-spatial.bin` file.
+    /// Loads a previously exported `.kira-spatial.bin` file with default config.
     pub fn from_kira_bin<P: AsRef<Path>>(path: P) -> Result<Self, SpatialIoError> {
         read_kira_bin(path)
+    }
+
+    /// Loads a `.kira-spatial.bin` file with explicit config (hash skip, memory cap, ...).
+    pub fn from_kira_bin_with<P: AsRef<Path>>(
+        path: P,
+        cfg: &LoadConfig,
+    ) -> Result<Self, SpatialIoError> {
+        read_kira_bin_with(path, cfg)
     }
 
     /// Exports the dataset as deterministic `.kira-spatial.bin`.
     pub fn export_kira_bin<P: AsRef<Path>>(&self, path: P) -> Result<(), SpatialIoError> {
         write_kira_bin(path, self)
+    }
+
+    /// Exports the dataset with an explicit compression policy.
+    pub fn export_kira_bin_with<P: AsRef<Path>>(
+        &self,
+        path: P,
+        compression: CompressionPolicy,
+    ) -> Result<(), SpatialIoError> {
+        write_kira_bin_with_compression(path, self, compression)
     }
 
     /// Returns canonical spatial domain.
@@ -76,7 +97,8 @@ impl Dataset {
         self.barcode_mapping.as_ref()
     }
 
-    pub(crate) fn from_parts(
+    /// Builds a [`Dataset`] from already-validated components.
+    pub fn from_parts(
         spatial_domain: SpatialDomain,
         expression_csr: BinsCsr,
         features: FeatureTable,
@@ -95,7 +117,8 @@ impl Dataset {
     }
 
     #[cfg(feature = "parquet")]
-    pub(crate) fn with_barcode_mapping(
+    /// Attaches an optional barcode mapping table to the dataset.
+    pub fn with_barcode_mapping(
         mut self,
         barcode_mapping: Option<BarcodeMappingTable>,
     ) -> Self {

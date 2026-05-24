@@ -4,7 +4,6 @@ use hdf5::File;
 use serde_json::json;
 
 use crate::api::dataset::Dataset;
-use crate::binary::hash::compute_dataset_hash;
 use crate::config::LoadConfig;
 use crate::determinism::{json::canonicalize_json, sort::sort_bins};
 use crate::error::SpatialIoError;
@@ -49,7 +48,7 @@ pub fn load_10x_h5<P: AsRef<Path>>(path: P, cfg: LoadConfig) -> Result<Dataset, 
     let n_bins = barcodes.len() as u32;
     let n_genes = feature_build.table.rows.len() as u32;
 
-    let mut metadata_core = DatasetMetaCore {
+    let metadata_core = DatasetMetaCore {
         dataset_name: paths
             .root_dir
             .file_name()
@@ -83,16 +82,6 @@ pub fn load_10x_h5<P: AsRef<Path>>(path: P, cfg: LoadConfig) -> Result<Dataset, 
             "duplicate_policy": "sum-per-bin-gene"
         }
     }));
-
-    let mut canonical_json_bytes = Vec::new();
-    crate::determinism::json::write_canonical_json(&mut canonical_json_bytes, &metadata_json)?;
-    metadata_core.dataset_hash = compute_dataset_hash(
-        &spatial_domain,
-        &csr,
-        &feature_build.table,
-        &metadata_core,
-        &canonical_json_bytes,
-    )?;
 
     Ok(Dataset::from_parts(
         spatial_domain,

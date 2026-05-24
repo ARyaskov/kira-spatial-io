@@ -4,7 +4,11 @@ use serde_json::json;
 
 use crate::api::dataset::Dataset;
 use crate::config::LoadConfig;
-use crate::determinism::{json::canonicalize_json, sort::sort_bins};
+use crate::binary::hash::compute_dataset_hash;
+use crate::determinism::{
+    json::{canonicalize_json, write_canonical_json},
+    sort::sort_bins,
+};
 use crate::error::SpatialIoError;
 use crate::model::metadata::DatasetMetaCore;
 #[cfg(feature = "parquet")]
@@ -50,11 +54,8 @@ pub(crate) fn load_10x_mtx<P: AsRef<Path>>(
     let feature_rows_raw = features::load_feature_rows(&paths.features_tsv)?;
     let feature_build = features::build_feature_table(feature_rows_raw)?;
 
-    let effective_cfg = LoadConfig {
-        memory_budget_mb: cfg.memory_budget_mb,
-        bin_level: effective_bin_level,
-        validate_strict: cfg.validate_strict,
-    };
+    let mut effective_cfg = cfg.clone();
+    effective_cfg.bin_level = effective_bin_level;
 
     let mut spatial_domain =
         spatial::load_spatial_domain(&paths.spatial_csv, &barcodes, &effective_cfg)?;
@@ -69,7 +70,7 @@ pub(crate) fn load_10x_mtx<P: AsRef<Path>>(
 
     let n_bins = barcodes.len() as u32;
     let n_genes = feature_build.table.rows.len() as u32;
-    let metadata_core = DatasetMetaCore {
+    let mut metadata_core = DatasetMetaCore {
         dataset_name: root
             .file_name()
             .and_then(|n| n.to_str())
@@ -154,6 +155,16 @@ pub(crate) fn load_10x_mtx<P: AsRef<Path>>(
     };
 
     let metadata_json = canonicalize_json(&metadata_json);
+
+    let mut canonical_json_bytes = Vec::new();
+    write_canonical_json(&mut canonical_json_bytes, &metadata_json)?;
+    metadata_core.dataset_hash = compute_dataset_hash(
+        &spatial_domain,
+        &csr,
+        &feature_build.table,
+        &metadata_core,
+        &canonical_json_bytes,
+    )?;
 
     let dataset = Dataset::from_parts(
         spatial_domain,

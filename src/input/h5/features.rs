@@ -1,5 +1,5 @@
 use crate::error::SpatialIoError;
-use crate::input::h5::barcodes::read_string_dataset;
+use crate::input::h5::strings::{read_optional_string_dataset, read_string_dataset_any};
 use crate::input::tenx::features::{FeatureBuildResult, FeatureRowRaw, build_feature_table};
 
 pub(crate) fn load_features(file: &hdf5::File) -> Result<FeatureBuildResult, SpatialIoError> {
@@ -12,8 +12,8 @@ pub(crate) fn load_features(file: &hdf5::File) -> Result<FeatureBuildResult, Spa
         )
     })?;
 
-    let names = read_string_dataset(&name_ds, "/matrix/features/name")?;
-    let feature_types = read_string_dataset(&feature_type_ds, "/matrix/features/feature_type")?;
+    let names = read_string_dataset_any(&name_ds, "/matrix/features/name")?;
+    let feature_types = read_string_dataset_any(&feature_type_ds, "/matrix/features/feature_type")?;
 
     if names.len() != feature_types.len() {
         return Err(SpatialIoError::DimensionMismatch(format!(
@@ -23,10 +23,22 @@ pub(crate) fn load_features(file: &hdf5::File) -> Result<FeatureBuildResult, Spa
         )));
     }
 
+    let feature_ids = read_optional_string_dataset(file, "/matrix/features/id")?
+        .unwrap_or_else(|| vec![String::new(); names.len()]);
+    if feature_ids.len() != names.len() {
+        return Err(SpatialIoError::DimensionMismatch(format!(
+            "feature id length {} differs from name length {}",
+            feature_ids.len(),
+            names.len()
+        )));
+    }
+
     let rows: Vec<FeatureRowRaw> = names
         .into_iter()
         .zip(feature_types)
-        .map(|(gene_name, feature_type)| FeatureRowRaw {
+        .zip(feature_ids)
+        .map(|((gene_name, feature_type), feature_id)| FeatureRowRaw {
+            feature_id,
             gene_name,
             feature_type,
         })

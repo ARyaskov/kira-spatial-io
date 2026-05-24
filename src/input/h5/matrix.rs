@@ -1,12 +1,15 @@
+//! CSR construction from 10x H5 layout.
+
 use std::mem::size_of;
 
 use hdf5::Dataset;
+use ndarray::s;
 
-use crate::config::LoadConfig;
-use crate::determinism::float::ensure_f32_finite_nonneg;
+use crate::config::{DuplicatePolicy, LoadConfig};
+use crate::determinism::float::{ensure_f32_finite, ensure_f32_finite_nonneg};
 use crate::error::SpatialIoError;
 use crate::input::tenx::mtx::ensure_budget;
-use crate::model::csr::BinsCsr;
+use crate::model::csr::{BinsCsr, Indptr};
 
 pub(crate) fn build_csr_from_h5(
     file: &hdf5::File,
@@ -100,14 +103,15 @@ pub(crate) fn build_csr_from_h5(
         as usize;
     if nnz_new != nnz {
         return Err(SpatialIoError::InvalidCsr(format!(
-            "nnz mismatch after bin remap: {} != {}",
-            nnz_new, nnz
+            "nnz mismatch after bin remap: {nnz_new} != {nnz}"
         )));
     }
 
     let mut indices = vec![0_u32; nnz];
     let mut data = vec![0_f32; nnz];
     let mut write_ptr = indptr_new[..n_barcodes].to_vec();
+    let mut insertion_order = vec![0_u32; nnz];
+    let mut next_seq: u32 = 0;
 
     let budget_bytes = (cfg.memory_budget_mb as u64)
         .checked_mul(1024)
@@ -120,7 +124,8 @@ pub(crate) fn build_csr_from_h5(
         .saturating_sub(final_csr_bytes)
         .saturating_sub(fixed_temp);
     let bytes_per_elem = (size_of::<u32>() + size_of::<f32>()) as u64;
-    let chunk_elems = usize::try_from((free_for_chunk / bytes_per_elem).max(1)).unwrap_or(1);
+    let chunk_elems = usize::try_from((free_for_chunk / bytes_per_elem).max(65_536).min(1_048_576))
+        .unwrap_or(65_536);
 
     for old_bin in 0..n_barcodes {
         let start = indptr_old[old_bin] as usize;
@@ -132,8 +137,9 @@ pub(crate) fn build_csr_from_h5(
         while cursor < end {
             let chunk_end = (cursor + chunk_elems).min(end);
 
-            let idx_chunk = read_u32_like_range(&indices_ds, cursor, chunk_end, "/matrix/indices")?;
-            let data_chunk = read_f32_like_range(&data_ds, cursor, chunk_end, "/matrix/data")?;
+            let idx_chunk = read_u32_like_slice(&indices_ds, cursor, chunk_end, "/matrix/indices")?;
+            let data_chunk =
+                read_f32_like_slice(&data_ds, cursor, chunk_end, "/matrix/data")?;
             if idx_chunk.len() != data_chunk.len() {
                 return Err(SpatialIoError::DimensionMismatch(
                     "indices/data chunk lengths mismatch".to_string(),
@@ -146,14 +152,15 @@ pub(crate) fn build_csr_from_h5(
                 let gene_old = gene_old_u32 as usize;
                 let gene_new = *feat_old_to_new.get(gene_old).ok_or_else(|| {
                     SpatialIoError::DimensionMismatch(format!(
-                        "feature index out of mapping range: {}",
-                        gene_old
+                        "feature index out of mapping range: {gene_old}"
                     ))
                 })?;
                 ensure_f32_finite_nonneg(value)?;
 
                 indices[out_base + i] = gene_new;
                 data[out_base + i] = value;
+                insertion_order[out_base + i] = next_seq;
+                next_seq = next_seq.wrapping_add(1);
             }
 
             offset_in_row += idx_chunk.len();
@@ -168,8 +175,7 @@ pub(crate) fn build_csr_from_h5(
     for row in 0..n_barcodes {
         if write_ptr[row] != indptr_new[row + 1] {
             return Err(SpatialIoError::InvalidCsr(format!(
-                "row write mismatch at {}: {} != {}",
-                row,
+                "row write mismatch at {row}: {} != {}",
                 write_ptr[row],
                 indptr_new[row + 1]
             )));
@@ -184,25 +190,34 @@ pub(crate) fn build_csr_from_h5(
         let start = indptr_new[row] as usize;
         let end = indptr_new[row + 1] as usize;
 
-        let mut pairs: Vec<(u32, f32)> = (start..end).map(|i| (indices[i], data[i])).collect();
-        pairs.sort_unstable_by_key(|(g, _)| *g);
+        let mut pairs: Vec<(u32, u32, f32)> = (start..end)
+            .map(|i| (indices[i], insertion_order[i], data[i]))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
         let mut i = 0usize;
         while i < pairs.len() {
             let gene = pairs[i].0;
             if gene as usize >= n_features {
                 return Err(SpatialIoError::InvalidCsr(format!(
-                    "gene index out of range after remap: {}",
-                    gene
+                    "gene index out of range after remap: {gene}"
                 )));
             }
 
-            let mut sum = pairs[i].1;
+            let mut sum = pairs[i].2;
+            let mut dup_count = 1;
             i += 1;
             while i < pairs.len() && pairs[i].0 == gene {
-                sum += pairs[i].1;
+                sum += pairs[i].2;
+                dup_count += 1;
                 i += 1;
             }
+            if dup_count > 1 && matches!(cfg.duplicate_policy, DuplicatePolicy::Error) {
+                return Err(SpatialIoError::InvalidCsr(format!(
+                    "duplicate (bin,gene)={row},{gene} with policy=Error"
+                )));
+            }
+            ensure_f32_finite(sum)?;
             ensure_f32_finite_nonneg(sum)?;
 
             indices[write_cursor] = gene;
@@ -217,7 +232,7 @@ pub(crate) fn build_csr_from_h5(
     data.truncate(write_cursor);
 
     validate_csr(BinsCsr {
-        indptr: indptr2,
+        indptr: Indptr::from_u64(indptr2),
         indices,
         data,
         n_bins: n_barcodes as u32,
@@ -233,24 +248,23 @@ fn validate_csr(csr: BinsCsr) -> Result<BinsCsr, SpatialIoError> {
             "indptr length mismatch".to_string(),
         ));
     }
-    if csr.indptr.first().copied().unwrap_or(1) != 0 {
+    if csr.indptr.first().unwrap_or(1) != 0 {
         return Err(SpatialIoError::InvalidCsr(
             "indptr[0] must be 0".to_string(),
         ));
     }
-    if csr.indptr.last().copied().unwrap_or(0) != csr.nnz {
+    if csr.indptr.last().unwrap_or(0) != csr.nnz {
         return Err(SpatialIoError::InvalidCsr(
             "indptr[last] must equal nnz".to_string(),
         ));
     }
 
     for row in 0..csr.n_bins as usize {
-        let s = csr.indptr[row] as usize;
-        let e = csr.indptr[row + 1] as usize;
+        let s = csr.indptr.get(row) as usize;
+        let e = csr.indptr.get(row + 1) as usize;
         if s > e {
             return Err(SpatialIoError::InvalidCsr(format!(
-                "indptr not monotonic at row {}",
-                row
+                "indptr not monotonic at row {row}"
             )));
         }
 
@@ -259,16 +273,14 @@ fn validate_csr(csr: BinsCsr) -> Result<BinsCsr, SpatialIoError> {
             let g = csr.indices[idx];
             if g >= csr.n_genes {
                 return Err(SpatialIoError::InvalidCsr(format!(
-                    "gene idx out of range {}",
-                    g
+                    "gene idx out of range {g}"
                 )));
             }
             if let Some(p) = prev
                 && g <= p
             {
                 return Err(SpatialIoError::InvalidCsr(format!(
-                    "row {} indices are not strictly increasing",
-                    row
+                    "row {row} indices are not strictly increasing"
                 )));
             }
             prev = Some(g);
@@ -284,7 +296,7 @@ fn read_shape(ds: &Dataset) -> Result<Vec<u64>, SpatialIoError> {
         return Ok(v);
     }
     if let Ok(v) = ds.read_raw::<u32>() {
-        return Ok(v.into_iter().map(|x| x as u64).collect());
+        return Ok(v.into_iter().map(u64::from).collect());
     }
     if let Ok(v) = ds.read_raw::<i64>() {
         return v
@@ -325,7 +337,7 @@ fn read_u64_like(ds: &Dataset, path: &str) -> Result<Vec<u64>, SpatialIoError> {
         return Ok(v);
     }
     if let Ok(v) = ds.read_raw::<u32>() {
-        return Ok(v.into_iter().map(|x| x as u64).collect());
+        return Ok(v.into_iter().map(u64::from).collect());
     }
     if let Ok(v) = ds.read_raw::<i64>() {
         return v
@@ -333,8 +345,7 @@ fn read_u64_like(ds: &Dataset, path: &str) -> Result<Vec<u64>, SpatialIoError> {
             .map(|x| {
                 if x < 0 {
                     Err(SpatialIoError::UnsupportedFormat(format!(
-                        "negative value in {}",
-                        path
+                        "negative value in {path}"
                     )))
                 } else {
                     Ok(x as u64)
@@ -348,8 +359,7 @@ fn read_u64_like(ds: &Dataset, path: &str) -> Result<Vec<u64>, SpatialIoError> {
             .map(|x| {
                 if x < 0 {
                     Err(SpatialIoError::UnsupportedFormat(format!(
-                        "negative value in {}",
-                        path
+                        "negative value in {path}"
                     )))
                 } else {
                     Ok(x as u64)
@@ -359,75 +369,96 @@ fn read_u64_like(ds: &Dataset, path: &str) -> Result<Vec<u64>, SpatialIoError> {
     }
 
     Err(SpatialIoError::UnsupportedFormat(format!(
-        "unsupported dtype in {}",
-        path
+        "unsupported dtype in {path}"
     )))
 }
 
-fn read_u32_like_range(
+fn read_u32_like_slice(
     ds: &Dataset,
     start: usize,
     end: usize,
     path: &str,
 ) -> Result<Vec<u32>, SpatialIoError> {
-    if let Ok(v) = ds.read_raw::<u32>() {
-        return Ok(slice_range(&v, start, end, path)?.to_vec());
+    let len = end - start;
+
+    if let Ok(v) = ds.read_slice_1d::<u32, _>(s![start..end]) {
+        return Ok(v.to_vec());
     }
-    if let Ok(v) = ds.read_raw::<u64>() {
-        let mut out = Vec::with_capacity(end.saturating_sub(start));
-        for &x in slice_range(&v, start, end, path)? {
-            if x > u32::MAX as u64 {
+    if let Ok(v) = ds.read_slice_1d::<u64, _>(s![start..end]) {
+        let mut out = Vec::with_capacity(len);
+        for x in v.iter() {
+            if *x > u32::MAX as u64 {
                 return Err(SpatialIoError::UnsupportedFormat(format!(
-                    "value too large for u32 in {}",
-                    path
+                    "value too large for u32 in {path}"
                 )));
             }
-            out.push(x as u32);
+            out.push(*x as u32);
         }
         return Ok(out);
     }
-    if let Ok(v) = ds.read_raw::<i32>() {
-        let mut out = Vec::with_capacity(end.saturating_sub(start));
-        for &x in slice_range(&v, start, end, path)? {
-            if x < 0 {
+    if let Ok(v) = ds.read_slice_1d::<i32, _>(s![start..end]) {
+        let mut out = Vec::with_capacity(len);
+        for x in v.iter() {
+            if *x < 0 {
                 return Err(SpatialIoError::UnsupportedFormat(format!(
-                    "negative value in {}",
-                    path
+                    "negative value in {path}"
                 )));
             }
-            out.push(x as u32);
+            out.push(*x as u32);
+        }
+        return Ok(out);
+    }
+    if let Ok(v) = ds.read_slice_1d::<i64, _>(s![start..end]) {
+        let mut out = Vec::with_capacity(len);
+        for x in v.iter() {
+            if *x < 0 || *x > u32::MAX as i64 {
+                return Err(SpatialIoError::UnsupportedFormat(format!(
+                    "value out of u32 range in {path}"
+                )));
+            }
+            out.push(*x as u32);
         }
         return Ok(out);
     }
 
     Err(SpatialIoError::UnsupportedFormat(format!(
-        "unsupported dtype in {}",
-        path
+        "unsupported dtype in {path}"
     )))
 }
 
-fn read_f32_like_range(
+fn read_f32_like_slice(
     ds: &Dataset,
     start: usize,
     end: usize,
     path: &str,
 ) -> Result<Vec<f32>, SpatialIoError> {
-    if let Ok(v) = ds.read_raw::<f32>() {
-        return Ok(slice_range(&v, start, end, path)?.to_vec());
+    let len = end - start;
+
+    if let Ok(v) = ds.read_slice_1d::<f32, _>(s![start..end]) {
+        return Ok(v.to_vec());
     }
-    if let Ok(v) = ds.read_raw::<f64>() {
-        let mut out = Vec::with_capacity(end.saturating_sub(start));
-        for &x in slice_range(&v, start, end, path)? {
-            let f = x as f32;
+    if let Ok(v) = ds.read_slice_1d::<f64, _>(s![start..end]) {
+        let mut out = Vec::with_capacity(len);
+        for x in v.iter() {
+            let f = *x as f32;
             ensure_f32_finite_nonneg(f)?;
             out.push(f);
         }
         return Ok(out);
     }
-    if let Ok(v) = ds.read_raw::<i32>() {
-        let mut out = Vec::with_capacity(end.saturating_sub(start));
-        for &x in slice_range(&v, start, end, path)? {
-            let f = x as f32;
+    if let Ok(v) = ds.read_slice_1d::<i32, _>(s![start..end]) {
+        let mut out = Vec::with_capacity(len);
+        for x in v.iter() {
+            let f = *x as f32;
+            ensure_f32_finite_nonneg(f)?;
+            out.push(f);
+        }
+        return Ok(out);
+    }
+    if let Ok(v) = ds.read_slice_1d::<u32, _>(s![start..end]) {
+        let mut out = Vec::with_capacity(len);
+        for x in v.iter() {
+            let f = *x as f32;
             ensure_f32_finite_nonneg(f)?;
             out.push(f);
         }
@@ -435,24 +466,6 @@ fn read_f32_like_range(
     }
 
     Err(SpatialIoError::UnsupportedFormat(format!(
-        "unsupported dtype in {}",
-        path
+        "unsupported dtype in {path}"
     )))
-}
-
-fn slice_range<'a, T>(
-    data: &'a [T],
-    start: usize,
-    end: usize,
-    path: &str,
-) -> Result<&'a [T], SpatialIoError> {
-    data.get(start..end).ok_or_else(|| {
-        SpatialIoError::DimensionMismatch(format!(
-            "slice out of bounds in {}: {}..{} with len {}",
-            path,
-            start,
-            end,
-            data.len()
-        ))
-    })
 }

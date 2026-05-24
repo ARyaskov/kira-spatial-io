@@ -1,40 +1,70 @@
+//! Deterministic reader for `.kira-spatial.bin` (format v2).
+
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use bitvec::vec::BitVec;
+use crc32fast::Hasher as Crc32;
 use serde_json::Value;
 
 use crate::api::dataset::Dataset;
+use crate::binary::bitmask::tissue_mask_from_u64_words;
+use crate::binary::compress::zstd_decompress;
 use crate::binary::format::{
-    ENDIAN_LITTLE, HEADER_SIZE, KIRA_SPATIAL_BIN_VERSION, MAGIC, SECTION_ENTRY_SIZE,
-    SECTION_ID_CSR, SECTION_ID_FEATURE_TABLE, SECTION_ID_META_CORE, SECTION_ID_META_JSON,
+    CSR_FLAG_INDPTR_U32, HEADER_SIZE, KIRA_SPATIAL_BIN_VERSION, MAGIC, MANDATORY_SECTION_IDS,
+    MAX_SECTION_COUNT, MIN_SECTION_COUNT, SECTION_ENTRY_SIZE, SECTION_FLAG_ZSTD, SECTION_ID_CSR,
+    SECTION_ID_FEATURE_TABLE, SECTION_ID_META_CORE, SECTION_ID_META_JSON,
     SECTION_ID_SPATIAL_DOMAIN, SectionEntry,
 };
 use crate::binary::hash::compute_dataset_hash;
+use crate::config::LoadConfig;
 use crate::determinism::float::{ensure_f32_finite_nonneg, total_cmp_f32};
 use crate::determinism::json::{canonicalize_json, write_canonical_json};
 use crate::error::SpatialIoError;
 use crate::model::{
     coord::CoordSystem,
-    csr::BinsCsr,
+    csr::{BinsCsr, Indptr},
     features::{FeatureRow, FeatureTable},
     metadata::DatasetMetaCore,
     spatial_domain::SpatialDomain,
 };
 
-/// Reads and validates a deterministic `.kira-spatial.bin` dataset.
+/// Reads and validates a deterministic `.kira-spatial.bin` dataset using the default config.
 pub fn read_kira_bin<P: AsRef<Path>>(p: P) -> Result<Dataset, SpatialIoError> {
-    let mut file = File::open(p.as_ref())?;
-    let mut bytes_vec = Vec::new();
-    file.read_to_end(&mut bytes_vec)?;
-    let bytes: &[u8] = &bytes_vec;
-    if bytes.len() < HEADER_SIZE as usize {
+    read_kira_bin_with(p, &LoadConfig::default())
+}
+
+/// Reads a dataset with explicit [`LoadConfig`] knobs (hash validation toggle, memory cap).
+pub fn read_kira_bin_with<P: AsRef<Path>>(
+    p: P,
+    cfg: &LoadConfig,
+) -> Result<Dataset, SpatialIoError> {
+    let path = p.as_ref();
+    let mut file = File::open(path).map_err(|e| SpatialIoError::io_at(path, e))?;
+    let file_meta = file.metadata().map_err(|e| SpatialIoError::io_at(path, e))?;
+    let file_len = file_meta.len();
+
+    let budget_bytes = (cfg.memory_budget_mb as u64)
+        .checked_mul(1024 * 1024)
+        .unwrap_or(u64::MAX);
+    if file_len > budget_bytes {
+        return Err(SpatialIoError::MemoryLimitExceeded(format!(
+            "file size {file_len} exceeds memory budget {budget_bytes}"
+        )));
+    }
+
+    if file_len < HEADER_SIZE {
         return Err(SpatialIoError::UnsupportedFormat(
             "file too small for header".to_string(),
         ));
     }
+
+    let cap = usize::try_from(file_len)
+        .map_err(|_| SpatialIoError::UnsupportedFormat("file too large for address space".to_string()))?;
+    let mut bytes_vec = Vec::with_capacity(cap);
+    file.read_to_end(&mut bytes_vec).map_err(|e| SpatialIoError::io_at(path, e))?;
+    let bytes: &[u8] = &bytes_vec;
 
     if &bytes[0..8] != MAGIC.as_slice() {
         return Err(SpatialIoError::UnsupportedFormat(
@@ -42,41 +72,34 @@ pub fn read_kira_bin<P: AsRef<Path>>(p: P) -> Result<Dataset, SpatialIoError> {
         ));
     }
 
-    let version = read_u16_at(bytes, 8, "header.version")?;
+    let version = u16_at(bytes, 8)?;
     if version != KIRA_SPATIAL_BIN_VERSION {
         return Err(SpatialIoError::UnsupportedFormat(format!(
-            "unsupported version: {}",
-            version
+            "unsupported version: {version} (this build supports v{KIRA_SPATIAL_BIN_VERSION})"
         )));
     }
 
-    let endian = *bytes
-        .get(10)
-        .ok_or_else(|| SpatialIoError::UnsupportedFormat("missing endian byte".to_string()))?;
-    if endian != ENDIAN_LITTLE {
+    let section_count = u16_at(bytes, 10)?;
+    if section_count < MIN_SECTION_COUNT {
         return Err(SpatialIoError::UnsupportedFormat(format!(
-            "unsupported endian flag: {}",
-            endian
+            "section_count too small: {section_count}"
         )));
     }
-
-    let section_count = read_u16_at(bytes, 11, "header.section_count")? as usize;
-    if section_count < 5 {
+    if section_count > MAX_SECTION_COUNT {
         return Err(SpatialIoError::UnsupportedFormat(format!(
-            "section_count too small: {}",
-            section_count
+            "section_count exceeds cap: {section_count} > {MAX_SECTION_COUNT}"
         )));
     }
 
     let mut header_hash = [0_u8; 16];
     header_hash.copy_from_slice(
         bytes
-            .get(13..29)
+            .get(16..32)
             .ok_or_else(|| SpatialIoError::UnsupportedFormat("missing header hash".to_string()))?,
     );
 
     let table_start = HEADER_SIZE as usize;
-    let table_len = section_count
+    let table_len = (section_count as usize)
         .checked_mul(SECTION_ENTRY_SIZE as usize)
         .ok_or_else(|| {
             SpatialIoError::UnsupportedFormat("section table size overflow".to_string())
@@ -84,40 +107,39 @@ pub fn read_kira_bin<P: AsRef<Path>>(p: P) -> Result<Dataset, SpatialIoError> {
     let table_end = table_start.checked_add(table_len).ok_or_else(|| {
         SpatialIoError::UnsupportedFormat("section table end overflow".to_string())
     })?;
-    if table_end > bytes.len() {
+    if table_end as u64 > file_len {
         return Err(SpatialIoError::UnsupportedFormat(
             "section table out of file bounds".to_string(),
         ));
     }
 
-    let mut sections = Vec::with_capacity(section_count);
-    for i in 0..section_count {
+    let mut sections = Vec::with_capacity(section_count as usize);
+    for i in 0..section_count as usize {
         let base = table_start + i * SECTION_ENTRY_SIZE as usize;
-        let id = read_u16_at(bytes, base, "section.id")?;
-        let offset = read_u64_at(bytes, base + 2, "section.offset")?;
-        let length = read_u64_at(bytes, base + 10, "section.length")?;
+        let id = u16_at(bytes, base)?;
+        let flags = u16_at(bytes, base + 2)?;
+        let offset = u64_at(bytes, base + 4)?;
+        let length = u64_at(bytes, base + 12)?;
+        let crc32c = u32_at(bytes, base + 20)?;
 
-        if offset % 64 != 0 {
+        if length > 0 && offset % 64 != 0 {
             return Err(SpatialIoError::UnsupportedFormat(format!(
-                "section {} offset is not 64-byte aligned: {}",
-                id, offset
+                "section {id} offset is not 64-byte aligned: {offset}"
             )));
         }
 
-        let end = offset.checked_add(length).ok_or_else(|| {
-            SpatialIoError::UnsupportedFormat(format!("section {} end overflow", id))
-        })?;
-        if end > bytes.len() as u64 {
-            return Err(SpatialIoError::UnsupportedFormat(format!(
-                "section {} out of file bounds: {}..{} > {}",
-                id,
-                offset,
-                end,
-                bytes.len()
-            )));
+        if length > 0 {
+            let end = offset.checked_add(length).ok_or_else(|| {
+                SpatialIoError::UnsupportedFormat(format!("section {id} end overflow"))
+            })?;
+            if end > file_len {
+                return Err(SpatialIoError::UnsupportedFormat(format!(
+                    "section {id} out of file bounds: {offset}..{end} > {file_len}"
+                )));
+            }
         }
 
-        sections.push(SectionEntry::new(id, offset, length));
+        sections.push(SectionEntry::new(id, flags, offset, length, crc32c));
     }
 
     let mut ranges: Vec<(u64, u64, u16)> = sections
@@ -131,22 +153,14 @@ pub fn read_kira_bin<P: AsRef<Path>>(p: P) -> Result<Dataset, SpatialIoError> {
         let (b_start, _b_end, b_id) = win[1];
         if a_end > b_start {
             return Err(SpatialIoError::UnsupportedFormat(format!(
-                "section overlap: {} [{}..{}) overlaps {} [{}..)",
-                a_id, a_start, a_end, b_id, b_start
+                "section overlap: {a_id} [{a_start}..{a_end}) overlaps {b_id} [{b_start}..)"
             )));
         }
     }
 
     let mut mandatory: HashMap<u16, SectionEntry> = HashMap::new();
     for section in &sections {
-        if matches!(
-            section.id,
-            SECTION_ID_SPATIAL_DOMAIN
-                | SECTION_ID_CSR
-                | SECTION_ID_FEATURE_TABLE
-                | SECTION_ID_META_CORE
-                | SECTION_ID_META_JSON
-        ) {
+        if MANDATORY_SECTION_IDS.contains(&section.id) {
             if section.offset == 0 || section.length == 0 {
                 return Err(SpatialIoError::UnsupportedFormat(format!(
                     "mandatory section {} has zero offset/length",
@@ -162,38 +176,49 @@ pub fn read_kira_bin<P: AsRef<Path>>(p: P) -> Result<Dataset, SpatialIoError> {
         }
     }
 
-    for required in [
-        SECTION_ID_SPATIAL_DOMAIN,
-        SECTION_ID_CSR,
-        SECTION_ID_FEATURE_TABLE,
-        SECTION_ID_META_CORE,
-        SECTION_ID_META_JSON,
-    ] {
+    for required in MANDATORY_SECTION_IDS {
         if !mandatory.contains_key(&required) {
             return Err(SpatialIoError::UnsupportedFormat(format!(
-                "missing mandatory section {}",
-                required
+                "missing mandatory section {required}"
             )));
         }
     }
 
-    let spatial =
-        decode_spatial_domain(section_bytes(bytes, mandatory[&SECTION_ID_SPATIAL_DOMAIN])?)?;
-    let csr = decode_csr(section_bytes(bytes, mandatory[&SECTION_ID_CSR])?)?;
-    let features =
-        decode_feature_table(section_bytes(bytes, mandatory[&SECTION_ID_FEATURE_TABLE])?)?;
-    let meta = decode_metadata_core(section_bytes(bytes, mandatory[&SECTION_ID_META_CORE])?)?;
-    let (metadata_json, canonical_json_bytes) =
-        decode_metadata_json(section_bytes(bytes, mandatory[&SECTION_ID_META_JSON])?)?;
+    for entry in mandatory.values() {
+        let raw = section_bytes(bytes, *entry)?;
+        let actual = compute_crc32(raw);
+        if actual != entry.crc32c {
+            return Err(SpatialIoError::CrcMismatch {
+                section_id: entry.id,
+                expected: entry.crc32c,
+                actual,
+            });
+        }
+    }
+
+    let spatial_raw = decode_section_payload(bytes, mandatory[&SECTION_ID_SPATIAL_DOMAIN])?;
+    let csr_raw = decode_section_payload(bytes, mandatory[&SECTION_ID_CSR])?;
+    let features_raw = decode_section_payload(bytes, mandatory[&SECTION_ID_FEATURE_TABLE])?;
+    let meta_raw = decode_section_payload(bytes, mandatory[&SECTION_ID_META_CORE])?;
+    let json_raw = decode_section_payload(bytes, mandatory[&SECTION_ID_META_JSON])?;
+
+    let spatial = decode_spatial_domain(&spatial_raw, budget_bytes)?;
+    let csr = decode_csr(&csr_raw, budget_bytes)?;
+    let features = decode_feature_table(&features_raw, budget_bytes)?;
+    let mut meta = decode_metadata_core(&meta_raw)?;
+    let (metadata_json, canonical_json_bytes) = decode_metadata_json(&json_raw, budget_bytes)?;
 
     validate_cross_section_invariants(&spatial, &csr, &features, &meta)?;
 
-    let computed_hash =
-        compute_dataset_hash(&spatial, &csr, &features, &meta, &canonical_json_bytes)?;
-    if computed_hash != header_hash || computed_hash != meta.dataset_hash {
-        return Err(SpatialIoError::UnsupportedFormat(
-            "dataset hash mismatch".to_string(),
-        ));
+    if cfg.validate_hash {
+        let computed_hash =
+            compute_dataset_hash(&spatial, &csr, &features, &meta, &canonical_json_bytes)?;
+        if computed_hash != header_hash {
+            return Err(SpatialIoError::HashMismatch);
+        }
+        meta.dataset_hash = computed_hash;
+    } else {
+        meta.dataset_hash = header_hash;
     }
 
     Ok(Dataset::from_parts(
@@ -203,6 +228,25 @@ pub fn read_kira_bin<P: AsRef<Path>>(p: P) -> Result<Dataset, SpatialIoError> {
         meta,
         metadata_json,
     ))
+}
+
+fn decode_section_payload<'a>(
+    bytes: &'a [u8],
+    entry: SectionEntry,
+) -> Result<std::borrow::Cow<'a, [u8]>, SpatialIoError> {
+    let raw = section_bytes(bytes, entry)?;
+    if entry.flags & SECTION_FLAG_ZSTD != 0 {
+        let decoded = zstd_decompress(raw)?;
+        Ok(std::borrow::Cow::Owned(decoded))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(raw))
+    }
+}
+
+fn compute_crc32(bytes: &[u8]) -> u32 {
+    let mut h = Crc32::new();
+    h.update(bytes);
+    h.finalize()
 }
 
 fn validate_cross_section_invariants(
@@ -253,7 +297,20 @@ fn section_bytes(all: &[u8], entry: SectionEntry) -> Result<&[u8], SpatialIoErro
         .ok_or_else(|| SpatialIoError::UnsupportedFormat("section slice out of bounds".to_string()))
 }
 
-fn decode_spatial_domain(data: &[u8]) -> Result<SpatialDomain, SpatialIoError> {
+fn ensure_alloc_within_budget(
+    bytes_needed: u64,
+    budget: u64,
+    ctx: &str,
+) -> Result<(), SpatialIoError> {
+    if bytes_needed > budget {
+        return Err(SpatialIoError::MemoryLimitExceeded(format!(
+            "{ctx}: would allocate {bytes_needed} bytes > budget {budget}"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_spatial_domain(data: &[u8], budget: u64) -> Result<SpatialDomain, SpatialIoError> {
     let mut r = SliceCursor::new(data, "spatial");
 
     let n_bins = r.read_u32("n_bins")? as usize;
@@ -261,6 +318,13 @@ fn decode_spatial_domain(data: &[u8]) -> Result<SpatialDomain, SpatialIoError> {
     let bin_level = r.read_u8("bin_level")?;
     let flags = r.read_u16("flags")?;
     let has_grid = (flags & 1) != 0;
+
+    let needed = (n_bins as u64)
+        .checked_mul((std::mem::size_of::<f32>() * 2 + std::mem::size_of::<u32>()) as u64)
+        .ok_or_else(|| {
+            SpatialIoError::UnsupportedFormat("spatial n_bins size overflow".to_string())
+        })?;
+    ensure_alloc_within_budget(needed, budget, "spatial domain declared size")?;
 
     let x = r.read_f32_vec(n_bins, "x")?;
     let y = r.read_f32_vec(n_bins, "y")?;
@@ -280,44 +344,28 @@ fn decode_spatial_domain(data: &[u8]) -> Result<SpatialDomain, SpatialIoError> {
 
     let n_bits = r.read_u64("tissue_mask.n_bits")?;
     let raw_bytes_len = r.read_u64("tissue_mask.raw_bytes_len")? as usize;
+    if !raw_bytes_len.is_multiple_of(8) {
+        return Err(SpatialIoError::UnsupportedFormat(
+            "spatial tissue raw length is not 8-byte aligned".to_string(),
+        ));
+    }
+    ensure_alloc_within_budget(raw_bytes_len as u64, budget, "tissue mask raw bytes")?;
     let raw_bytes = r.read_bytes(raw_bytes_len, "tissue_mask.raw")?;
 
     if n_bits as usize != n_bins {
         return Err(SpatialIoError::DimensionMismatch(format!(
-            "spatial tissue bits {} != n_bins {}",
-            n_bits, n_bins
+            "spatial tissue bits {n_bits} != n_bins {n_bins}"
         )));
     }
 
-    if !raw_bytes_len.is_multiple_of(std::mem::size_of::<usize>()) {
-        return Err(SpatialIoError::UnsupportedFormat(
-            "spatial tissue raw length is not word-aligned".to_string(),
-        ));
+    let mut words = Vec::with_capacity(raw_bytes_len / 8);
+    for chunk in raw_bytes.chunks_exact(8) {
+        let mut arr = [0_u8; 8];
+        arr.copy_from_slice(chunk);
+        words.push(u64::from_le_bytes(arr));
     }
 
-    let mut words = Vec::with_capacity(raw_bytes_len / std::mem::size_of::<usize>());
-    for chunk in raw_bytes.chunks_exact(std::mem::size_of::<usize>()) {
-        #[cfg(target_pointer_width = "64")]
-        {
-            let mut arr = [0_u8; 8];
-            arr.copy_from_slice(chunk);
-            words.push(usize::from_le_bytes(arr));
-        }
-        #[cfg(target_pointer_width = "32")]
-        {
-            let mut arr = [0_u8; 4];
-            arr.copy_from_slice(chunk);
-            words.push(usize::from_le_bytes(arr));
-        }
-    }
-
-    let mut tissue_mask = BitVec::from_vec(words);
-    if tissue_mask.len() < n_bits as usize {
-        return Err(SpatialIoError::UnsupportedFormat(
-            "spatial tissue mask bit length shorter than declared".to_string(),
-        ));
-    }
-    tissue_mask.truncate(n_bits as usize);
+    let tissue_mask = tissue_mask_from_u64_words(&words, n_bins);
 
     if !r.is_eof() {
         return Err(SpatialIoError::UnsupportedFormat(
@@ -328,8 +376,7 @@ fn decode_spatial_domain(data: &[u8]) -> Result<SpatialDomain, SpatialIoError> {
     for (i, &id) in bin_id.iter().enumerate() {
         if id != i as u32 {
             return Err(SpatialIoError::InvalidCsr(format!(
-                "spatial domain invariant: bin_id[{}] = {}, expected {}",
-                i, id, i
+                "spatial domain invariant: bin_id[{i}] = {id}, expected {i}"
             )));
         }
     }
@@ -372,16 +419,31 @@ fn decode_spatial_domain(data: &[u8]) -> Result<SpatialDomain, SpatialIoError> {
     )
 }
 
-fn decode_csr(data: &[u8]) -> Result<BinsCsr, SpatialIoError> {
+fn decode_csr(data: &[u8], budget: u64) -> Result<BinsCsr, SpatialIoError> {
     let mut r = SliceCursor::new(data, "csr");
 
     let n_bins = r.read_u32("n_bins")?;
     let n_genes = r.read_u32("n_genes")?;
     let nnz = r.read_u64("nnz")?;
     let normalized = r.read_u8("normalized")? != 0;
-    r.read_bytes(7, "reserved")?;
+    let flags = r.read_u8("flags")?;
+    r.read_bytes(6, "reserved")?;
 
-    let indptr = r.read_u64_vec(n_bins as usize + 1, "indptr")?;
+    let indptr_u32 = flags & CSR_FLAG_INDPTR_U32 != 0;
+
+    let elem_bytes = 4_u64
+        + 4
+        + if indptr_u32 { 4 } else { 8 };
+    let total = (nnz)
+        .checked_mul(elem_bytes)
+        .ok_or_else(|| SpatialIoError::UnsupportedFormat("csr nnz size overflow".to_string()))?;
+    ensure_alloc_within_budget(total, budget, "csr declared size")?;
+
+    let indptr: Indptr = if indptr_u32 {
+        Indptr::U32(r.read_u32_vec(n_bins as usize + 1, "indptr")?)
+    } else {
+        Indptr::U64(r.read_u64_vec(n_bins as usize + 1, "indptr")?)
+    };
     let indices = r.read_u32_vec(nnz as usize, "indices")?;
     let data_values = r.read_f32_vec(nnz as usize, "data")?;
 
@@ -391,51 +453,53 @@ fn decode_csr(data: &[u8]) -> Result<BinsCsr, SpatialIoError> {
         ));
     }
 
-    if indptr.first().copied().unwrap_or(1) != 0 {
+    if indptr.first().unwrap_or(1) != 0 {
         return Err(SpatialIoError::InvalidCsr(
             "csr invariant: indptr[0] must be 0".to_string(),
         ));
     }
-    if indptr.last().copied().unwrap_or(0) != nnz {
+    if indptr.last().unwrap_or(0) != nnz {
         return Err(SpatialIoError::InvalidCsr(format!(
-            "csr invariant: indptr[last] {} != nnz {}",
-            indptr.last().copied().unwrap_or(0),
-            nnz
+            "csr invariant: indptr[last] {} != nnz {nnz}",
+            indptr.last().unwrap_or(0)
         )));
     }
 
     for i in 1..indptr.len() {
-        if indptr[i] < indptr[i - 1] {
+        if indptr.get(i) < indptr.get(i - 1) {
             return Err(SpatialIoError::InvalidCsr(format!(
-                "csr invariant: indptr not monotonic at {}",
-                i
+                "csr invariant: indptr not monotonic at {i}"
             )));
         }
     }
 
     for row in 0..n_bins as usize {
-        let start = indptr[row] as usize;
-        let end = indptr[row + 1] as usize;
+        let start = indptr.get(row) as usize;
+        let end = indptr.get(row + 1) as usize;
 
         let mut prev: Option<u32> = None;
         for idx in start..end {
             let gene = indices[idx];
             if gene >= n_genes {
                 return Err(SpatialIoError::InvalidCsr(format!(
-                    "csr invariant: gene index out of bounds in row {}: {} >= {}",
-                    row, gene, n_genes
+                    "csr invariant: gene index out of bounds in row {row}: {gene} >= {n_genes}"
                 )));
             }
             if let Some(p) = prev
                 && gene <= p
             {
                 return Err(SpatialIoError::InvalidCsr(format!(
-                    "csr invariant: row {} indices are not strictly increasing",
-                    row
+                    "csr invariant: row {row} indices are not strictly increasing"
                 )));
             }
             prev = Some(gene);
-            ensure_f32_finite_nonneg(data_values[idx])?;
+            if !normalized {
+                ensure_f32_finite_nonneg(data_values[idx])?;
+            } else if !data_values[idx].is_finite() {
+                return Err(SpatialIoError::InvalidFloat(
+                    "csr data contains non-finite value".to_string(),
+                ));
+            }
         }
     }
 
@@ -450,10 +514,15 @@ fn decode_csr(data: &[u8]) -> Result<BinsCsr, SpatialIoError> {
     })
 }
 
-fn decode_feature_table(data: &[u8]) -> Result<FeatureTable, SpatialIoError> {
+fn decode_feature_table(data: &[u8], budget: u64) -> Result<FeatureTable, SpatialIoError> {
     let mut r = SliceCursor::new(data, "feature_table");
 
     let n_genes = r.read_u32("n_genes")? as usize;
+    ensure_alloc_within_budget(
+        (n_genes as u64).saturating_mul(64),
+        budget,
+        "feature table declared size",
+    )?;
     let mut rows = Vec::with_capacity(n_genes);
     let mut seen_names = HashSet::with_capacity(n_genes);
     let mut prev_name: Option<String> = None;
@@ -462,18 +531,17 @@ fn decode_feature_table(data: &[u8]) -> Result<FeatureTable, SpatialIoError> {
         let gene_id = r.read_u32("gene_id")?;
         if gene_id != i as u32 {
             return Err(SpatialIoError::InvalidCsr(format!(
-                "feature table invariant: gene_id {} != {}",
-                gene_id, i
+                "feature table invariant: gene_id {gene_id} != {i}"
             )));
         }
 
+        let feature_id = r.read_len_prefixed_string("feature_id")?;
         let gene_name = r.read_len_prefixed_string("gene_name")?;
         let feature_type = r.read_len_prefixed_string("feature_type")?;
 
         if !seen_names.insert(gene_name.clone()) {
             return Err(SpatialIoError::InvalidCsr(format!(
-                "feature table invariant: duplicate gene_name {}",
-                gene_name
+                "feature table invariant: duplicate gene_name {gene_name}"
             )));
         }
         if let Some(prev) = &prev_name
@@ -487,6 +555,7 @@ fn decode_feature_table(data: &[u8]) -> Result<FeatureTable, SpatialIoError> {
 
         rows.push(FeatureRow {
             gene_id,
+            feature_id,
             gene_name,
             feature_type,
         });
@@ -512,10 +581,6 @@ fn decode_metadata_core(data: &[u8]) -> Result<DatasetMetaCore, SpatialIoError> 
     let nnz = r.read_u64("nnz")?;
     let coord_system = u8_to_coord_system(r.read_u8("coord_system")?)?;
     let normalized = r.read_u8("normalized")? != 0;
-    let hash = r.read_bytes(16, "dataset_hash")?;
-
-    let mut dataset_hash = [0_u8; 16];
-    dataset_hash.copy_from_slice(hash);
 
     if !r.is_eof() {
         return Err(SpatialIoError::UnsupportedFormat(
@@ -532,15 +597,16 @@ fn decode_metadata_core(data: &[u8]) -> Result<DatasetMetaCore, SpatialIoError> 
         nnz,
         coord_system,
         normalized,
-        dataset_hash,
+        dataset_hash: [0_u8; 16],
     })
 }
 
-fn decode_metadata_json(data: &[u8]) -> Result<(Value, Vec<u8>), SpatialIoError> {
+fn decode_metadata_json(data: &[u8], budget: u64) -> Result<(Value, Vec<u8>), SpatialIoError> {
     let mut r = SliceCursor::new(data, "metadata_json");
 
-    let json_len = r.read_u64("json_len")? as usize;
-    let json_bytes = r.read_bytes(json_len, "json")?.to_vec();
+    let json_len = r.read_u64("json_len")?;
+    ensure_alloc_within_budget(json_len, budget, "metadata json declared length")?;
+    let json_bytes = r.read_bytes(json_len as usize, "json")?.to_vec();
     if !r.is_eof() {
         return Err(SpatialIoError::UnsupportedFormat(
             "metadata_json section has trailing bytes".to_string(),
@@ -564,19 +630,28 @@ fn decode_metadata_json(data: &[u8]) -> Result<(Value, Vec<u8>), SpatialIoError>
     Ok((canonical, canonical_bytes))
 }
 
-fn read_u16_at(data: &[u8], offset: usize, ctx: &str) -> Result<u16, SpatialIoError> {
+fn u16_at(data: &[u8], offset: usize) -> Result<u16, SpatialIoError> {
     let slice = data
         .get(offset..offset + 2)
-        .ok_or_else(|| SpatialIoError::UnsupportedFormat(format!("{} out of bounds", ctx)))?;
+        .ok_or_else(|| SpatialIoError::UnsupportedFormat("read out of bounds".to_string()))?;
     let mut arr = [0_u8; 2];
     arr.copy_from_slice(slice);
     Ok(u16::from_le_bytes(arr))
 }
 
-fn read_u64_at(data: &[u8], offset: usize, ctx: &str) -> Result<u64, SpatialIoError> {
+fn u32_at(data: &[u8], offset: usize) -> Result<u32, SpatialIoError> {
+    let slice = data
+        .get(offset..offset + 4)
+        .ok_or_else(|| SpatialIoError::UnsupportedFormat("read out of bounds".to_string()))?;
+    let mut arr = [0_u8; 4];
+    arr.copy_from_slice(slice);
+    Ok(u32::from_le_bytes(arr))
+}
+
+fn u64_at(data: &[u8], offset: usize) -> Result<u64, SpatialIoError> {
     let slice = data
         .get(offset..offset + 8)
-        .ok_or_else(|| SpatialIoError::UnsupportedFormat(format!("{} out of bounds", ctx)))?;
+        .ok_or_else(|| SpatialIoError::UnsupportedFormat("read out of bounds".to_string()))?;
     let mut arr = [0_u8; 8];
     arr.copy_from_slice(slice);
     Ok(u64::from_le_bytes(arr))
@@ -588,8 +663,7 @@ fn u8_to_coord_system(v: u8) -> Result<CoordSystem, SpatialIoError> {
         1 => Ok(CoordSystem::Pixel),
         2 => Ok(CoordSystem::Micron),
         _ => Err(SpatialIoError::UnsupportedFormat(format!(
-            "invalid coord_system value: {}",
-            v
+            "invalid coord_system value: {v}"
         ))),
     }
 }
@@ -615,12 +689,15 @@ impl<'a> SliceCursor<'a> {
 
     fn read_bytes(&mut self, len: usize, field: &str) -> Result<&'a [u8], SpatialIoError> {
         let end = self.pos.checked_add(len).ok_or_else(|| {
-            SpatialIoError::UnsupportedFormat(format!("{}.{field} read overflow", self.section))
+            SpatialIoError::UnsupportedFormat(format!(
+                "{}.{} read overflow",
+                self.section, field
+            ))
         })?;
         let slice = self.data.get(self.pos..end).ok_or_else(|| {
             SpatialIoError::UnsupportedFormat(format!(
-                "{}.{field} out of bounds at {}..{}",
-                self.section, self.pos, end
+                "{}.{} out of bounds at {}..{}",
+                self.section, field, self.pos, end
             ))
         })?;
         self.pos = end;
@@ -649,38 +726,29 @@ impl<'a> SliceCursor<'a> {
         Ok(u64::from_le_bytes(arr))
     }
 
-    fn read_f32(&mut self, field: &str) -> Result<f32, SpatialIoError> {
-        let mut arr = [0_u8; 4];
-        arr.copy_from_slice(self.read_bytes(4, field)?);
-        Ok(f32::from_le_bytes(arr))
-    }
-
     fn read_u32_vec(&mut self, n: usize, field: &str) -> Result<Vec<u32>, SpatialIoError> {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.read_u32(field)?);
-        }
+        let bytes = self.read_bytes(n * 4, field)?;
+        let mut out: Vec<u32> = vec![0; n];
+        bytemuck::cast_slice_mut::<u32, u8>(&mut out).copy_from_slice(bytes);
         Ok(out)
     }
 
     fn read_u64_vec(&mut self, n: usize, field: &str) -> Result<Vec<u64>, SpatialIoError> {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.read_u64(field)?);
-        }
+        let bytes = self.read_bytes(n * 8, field)?;
+        let mut out: Vec<u64> = vec![0; n];
+        bytemuck::cast_slice_mut::<u64, u8>(&mut out).copy_from_slice(bytes);
         Ok(out)
     }
 
     fn read_f32_vec(&mut self, n: usize, field: &str) -> Result<Vec<f32>, SpatialIoError> {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.read_f32(field)?);
-        }
+        let bytes = self.read_bytes(n * 4, field)?;
+        let mut out: Vec<f32> = vec![0.0; n];
+        bytemuck::cast_slice_mut::<f32, u8>(&mut out).copy_from_slice(bytes);
         Ok(out)
     }
 
     fn read_len_prefixed_string(&mut self, field: &str) -> Result<String, SpatialIoError> {
-        let len = self.read_u32(&format!("{}.len", field))? as usize;
+        let len = self.read_u32(&format!("{field}.len"))? as usize;
         let bytes = self.read_bytes(len, field)?;
         String::from_utf8(bytes.to_vec()).map_err(|e| {
             SpatialIoError::UnsupportedFormat(format!(

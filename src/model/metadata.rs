@@ -2,6 +2,7 @@ use crate::model::coord::CoordSystem;
 
 /// Fixed metadata core serialized in section `MetadataCore`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DatasetMetaCore {
     /// Dataset label.
     pub dataset_name: String,
@@ -19,7 +20,7 @@ pub struct DatasetMetaCore {
     pub coord_system: CoordSystem,
     /// Normalization marker.
     pub normalized: bool,
-    /// Canonical dataset hash (BLAKE3-128).
+    /// Canonical dataset hash (BLAKE3 leading 16 bytes). Populated by readers; ignored on write.
     pub dataset_hash: [u8; 16],
 }
 

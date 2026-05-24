@@ -36,6 +36,9 @@ fn feature_table_sorted_and_reindexed() {
     assert_eq!(ds.features().rows[1].gene_name, "B");
     assert_eq!(ds.features().rows[0].gene_id, 0);
     assert_eq!(ds.features().rows[1].gene_id, 1);
+    // feature_id is the column-0 upstream id (e.g. Ensembl); it must be preserved.
+    assert_eq!(ds.features().rows[0].feature_id, "id_a");
+    assert_eq!(ds.features().rows[1].feature_id, "id_b");
 
     fs::remove_dir_all(&root).expect("cleanup");
 }

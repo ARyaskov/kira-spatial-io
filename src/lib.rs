@@ -1,7 +1,7 @@
-#![forbid(unsafe_code)]
+//! Deterministic IO library for spatial transcriptomics datasets.
+
+#![deny(unsafe_code)]
 #![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![deny(missing_docs)]
 #![allow(
     clippy::bool_to_int_with_if,
     clippy::cast_possible_truncation,
@@ -21,35 +21,27 @@
     clippy::struct_excessive_bools,
     clippy::too_many_lines,
     clippy::trivially_copy_pass_by_ref,
-    clippy::uninlined_format_args,
-    dead_code,
-    unused_imports
+    clippy::uninlined_format_args
 )]
 
-//! Deterministic IO library for spatial transcriptomics datasets.
+#[cfg(target_endian = "big")]
+compile_error!("kira-spatial-io requires a little-endian target");
 
-/// Public dataset API entry points.
 pub mod api;
-/// Binary format primitives, reader, writer, and hashing.
 pub mod binary;
-/// Dataset loading configuration.
 pub mod config;
-/// Determinism helpers for sorting, float checks, and canonical JSON.
 pub mod determinism;
-/// Error model used across all IO operations.
 pub mod error;
-/// Input format loaders.
 pub mod input;
-/// Core in-memory data model types.
 pub mod model;
 
 pub use api::dataset::Dataset;
-#[cfg(feature = "parquet")]
+#[cfg(all(feature = "parquet", feature = "hdf5"))]
 pub use api::feature_slice::{FeatureSliceGene, load_feature_slice_gene};
-pub use config::LoadConfig;
-pub use error::SpatialIoError;
+pub use config::{CompressionPolicy, DuplicatePolicy, LoadConfig};
+pub use error::{IoPathExt, SpatialIoError};
 pub use model::coord::CoordSystem;
-pub use model::csr::BinsCsr;
+pub use model::csr::{BinsCsr, Indptr};
 pub use model::features::{FeatureRow, FeatureTable};
 #[cfg(feature = "parquet")]
 pub use model::mapping::{BarcodeMappingRow, BarcodeMappingTable};

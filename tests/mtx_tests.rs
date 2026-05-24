@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kira_spatial_io::{Dataset, LoadConfig};
+use kira_spatial_io::{Dataset, DuplicatePolicy, LoadConfig};
 
 #[test]
 fn unsorted_triplets_become_sorted_by_gene_in_each_row() {
@@ -31,7 +31,7 @@ fn unsorted_triplets_become_sorted_by_gene_in_each_row() {
     .expect("spatial");
 
     let ds = Dataset::open_10x(&root, LoadConfig::default()).expect("open");
-    assert_eq!(ds.expression_csr().indptr, vec![0, 2, 4]);
+    assert_eq!(ds.expression_csr().indptr.to_u64_vec(), vec![0, 2, 4]);
     assert_eq!(ds.expression_csr().indices, vec![0, 1, 1, 2]);
 
     fs::remove_dir_all(&root).expect("cleanup");
@@ -64,9 +64,45 @@ fn duplicate_gene_entries_are_summed_and_compacted() {
     .expect("spatial");
 
     let ds = Dataset::open_10x(&root, LoadConfig::default()).expect("open");
-    assert_eq!(ds.expression_csr().indptr, vec![0, 2, 3]);
+    assert_eq!(ds.expression_csr().indptr.to_u64_vec(), vec![0, 2, 3]);
     assert_eq!(ds.expression_csr().indices, vec![0, 1, 1]);
     assert_eq!(ds.expression_csr().data, vec![5.0, 4.0, 1.0]);
+
+    fs::remove_dir_all(&root).expect("cleanup");
+}
+
+#[test]
+fn duplicate_policy_error_rejects_duplicates() {
+    let root = temp_root("mtx_dup_policy_error");
+    let matrix_dir = root.join("filtered_feature_bc_matrix");
+    let spatial_dir = root.join("spatial");
+
+    fs::create_dir_all(&matrix_dir).expect("matrix dir");
+    fs::create_dir_all(&spatial_dir).expect("spatial dir");
+
+    fs::write(matrix_dir.join("barcodes.tsv"), "BC1\n").expect("barcodes");
+    fs::write(
+        matrix_dir.join("features.tsv"),
+        "id1\tA\tGene Expression\n",
+    )
+    .expect("features");
+    fs::write(
+        matrix_dir.join("matrix.mtx"),
+        "%%MatrixMarket matrix coordinate integer general\n1 1 2\n1 1 1\n1 1 1\n",
+    )
+    .expect("mtx");
+    fs::write(
+        spatial_dir.join("tissue_positions.csv"),
+        "barcode,in_tissue,array_row,array_col,pxl_row_in_fullres,pxl_col_in_fullres\nBC1,1,0,0,10,10\n",
+    )
+    .expect("spatial");
+
+    let cfg = LoadConfig {
+        duplicate_policy: DuplicatePolicy::Error,
+        ..LoadConfig::default()
+    };
+    let err = Dataset::open_10x(&root, cfg).expect_err("must reject duplicates");
+    assert!(err.to_string().contains("duplicate"));
 
     fs::remove_dir_all(&root).expect("cleanup");
 }
@@ -100,7 +136,7 @@ fn bin_permutation_mapping_changes_row_assignment() {
     .expect("spatial");
 
     let ds = Dataset::open_10x(&root, LoadConfig::default()).expect("open");
-    assert_eq!(ds.expression_csr().indptr, vec![0, 1, 2]);
+    assert_eq!(ds.expression_csr().indptr.to_u64_vec(), vec![0, 1, 2]);
     assert_eq!(ds.expression_csr().indices, vec![1, 0]);
     assert_eq!(ds.expression_csr().data, vec![9.0, 8.0]);
 
@@ -133,8 +169,7 @@ fn budget_enforcement_triggers_error() {
         &root,
         LoadConfig {
             memory_budget_mb: 0,
-            bin_level: None,
-            validate_strict: true,
+            ..LoadConfig::default()
         },
     )
     .expect_err("must fail");

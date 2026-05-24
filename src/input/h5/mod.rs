@@ -9,6 +9,7 @@ pub(crate) mod discover;
 pub(crate) mod features;
 pub(crate) mod loader;
 pub(crate) mod matrix;
+pub(crate) mod strings;
 
 pub(crate) fn load_h5_dataset<P: AsRef<Path>>(
     path: P,

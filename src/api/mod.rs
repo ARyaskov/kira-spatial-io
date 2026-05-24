@@ -1,6 +1,4 @@
-/// Main immutable dataset type.
 pub mod dataset;
 
-/// Feature-slice targeted loaders.
-#[cfg(feature = "parquet")]
+#[cfg(all(feature = "parquet", feature = "hdf5"))]
 pub mod feature_slice;

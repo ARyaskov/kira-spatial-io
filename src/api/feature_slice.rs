@@ -1,13 +1,16 @@
+//! Targeted single-gene loader from Visium HD `feature_slice.h5`.
+
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use hdf5::File;
+use ndarray::s;
 
 use crate::config::LoadConfig;
 use crate::determinism::sort::sort_bins;
 use crate::error::SpatialIoError;
 use crate::input::h5::discover;
+use crate::input::h5::strings::read_string_dataset_any;
 use crate::input::parquet::barcode_mapping::load_barcode_mapping_parquet;
 use crate::input::parquet::spatial_mapping::load_spatial_domain_from_mapping_table;
 use crate::model::spatial_domain::SpatialDomain;
@@ -34,7 +37,6 @@ pub fn load_feature_slice_gene<P: AsRef<Path>>(
                 "feature_slice fallback requires barcode_mappings.parquet".to_string(),
             ));
         }
-        #[cfg(feature = "parquet")]
         discover::SpatialInput::Parquet(path) => path.clone(),
     };
 
@@ -45,42 +47,32 @@ pub fn load_feature_slice_gene<P: AsRef<Path>>(
         ))
     })?;
 
-    let feature_index = match resolve_feature_index_from_h5(&h5, gene_name) {
-        Ok(idx) => idx,
-        Err(_) => resolve_feature_index_with_h5dump(&paths.h5_path, gene_name)?,
-    };
+    let feature_index = resolve_feature_index(&h5, gene_name)?;
 
     let slice_base = format!("/feature_slices/{feature_index}");
     let row_ds = h5.dataset(&(slice_base.clone() + "/row")).map_err(|_| {
         SpatialIoError::UnsupportedFormat(format!(
-            "missing {}/row dataset for gene {}",
-            slice_base, gene_name
+            "missing {slice_base}/row dataset for gene {gene_name}"
         ))
     })?;
     let col_ds = h5.dataset(&(slice_base.clone() + "/col")).map_err(|_| {
         SpatialIoError::UnsupportedFormat(format!(
-            "missing {}/col dataset for gene {}",
-            slice_base, gene_name
+            "missing {slice_base}/col dataset for gene {gene_name}"
         ))
     })?;
     let data_ds = h5.dataset(&(slice_base.clone() + "/data")).map_err(|_| {
         SpatialIoError::UnsupportedFormat(format!(
-            "missing {}/data dataset for gene {}",
-            slice_base, gene_name
+            "missing {slice_base}/data dataset for gene {gene_name}"
         ))
     })?;
 
-    let rows =
-        read_u32_dataset_with_fallback(&row_ds, &paths.h5_path, &(slice_base.clone() + "/row"))?;
-    let cols =
-        read_u32_dataset_with_fallback(&col_ds, &paths.h5_path, &(slice_base.clone() + "/col"))?;
-    let counts =
-        read_u32_dataset_with_fallback(&data_ds, &paths.h5_path, &(slice_base.clone() + "/data"))?;
+    let rows = read_u32_dataset(&row_ds, &(slice_base.clone() + "/row"))?;
+    let cols = read_u32_dataset(&col_ds, &(slice_base.clone() + "/col"))?;
+    let counts = read_u32_dataset(&data_ds, &(slice_base.clone() + "/data"))?;
 
     if rows.len() != cols.len() || rows.len() != counts.len() {
         return Err(SpatialIoError::DimensionMismatch(format!(
-            "feature slice arrays length mismatch for {}: row={}, col={}, data={}",
-            gene_name,
+            "feature slice arrays length mismatch for {gene_name}: row={}, col={}, data={}",
             rows.len(),
             cols.len(),
             counts.len()
@@ -122,8 +114,7 @@ pub fn load_feature_slice_gene<P: AsRef<Path>>(
 
     if cfg.validate_strict && missing_coords > 0 {
         return Err(SpatialIoError::DimensionMismatch(format!(
-            "feature slice entries without coordinate match in parquet mapping: {}",
-            missing_coords
+            "feature slice entries without coordinate match in parquet mapping: {missing_coords}"
         )));
     }
 
@@ -133,10 +124,7 @@ pub fn load_feature_slice_gene<P: AsRef<Path>>(
     })
 }
 
-fn resolve_feature_index_from_h5(
-    file: &hdf5::File,
-    gene_name: &str,
-) -> Result<usize, SpatialIoError> {
+fn resolve_feature_index(file: &hdf5::File, gene_name: &str) -> Result<usize, SpatialIoError> {
     let names_ds = file.dataset("/features/name").map_err(|_| {
         SpatialIoError::UnsupportedFormat("missing /features/name dataset".to_string())
     })?;
@@ -146,171 +134,56 @@ fn resolve_feature_index_from_h5(
         .position(|name| name == gene_name)
         .ok_or_else(|| {
             SpatialIoError::UnsupportedFormat(format!(
-                "gene not found in /features/name: {}",
-                gene_name
+                "gene not found in /features/name: {gene_name}"
             ))
         })
 }
 
-fn resolve_feature_index_with_h5dump(
-    h5_path: &Path,
-    gene_name: &str,
-) -> Result<usize, SpatialIoError> {
-    let out = Command::new("h5dump")
-        .arg("-d")
-        .arg("/features/name")
-        .arg(h5_path)
-        .output()
-        .map_err(|e| {
-            SpatialIoError::UnsupportedFormat(format!(
-                "failed to run h5dump for /features/name: {e}"
-            ))
-        })?;
-
-    if !out.status.success() {
-        return Err(SpatialIoError::UnsupportedFormat(
-            "h5dump failed reading /features/name".to_string(),
-        ));
+fn read_u32_dataset(ds: &hdf5::Dataset, path: &str) -> Result<Vec<u32>, SpatialIoError> {
+    if let Ok(v) = ds.read_raw::<u32>() {
+        return Ok(v);
     }
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let marker_with_null = format!("\"{}\\000", gene_name);
-    let marker_exact = format!("\"{}\"", gene_name);
-    for line in stdout.lines() {
-        if !(line.contains(&marker_with_null) || line.contains(&marker_exact)) {
-            continue;
+    if let Ok(v) = ds.read_raw::<u64>() {
+        let mut out = Vec::with_capacity(v.len());
+        for x in v {
+            if x > u32::MAX as u64 {
+                return Err(SpatialIoError::UnsupportedFormat(format!(
+                    "value too large for u32 in {path}"
+                )));
+            }
+            out.push(x as u32);
         }
-        if let Some((idx, _name)) = parse_h5dump_feature_line(line) {
-            return Ok(idx);
-        }
+        return Ok(out);
     }
-
+    if let Ok(v) = ds.read_raw::<i32>() {
+        let mut out = Vec::with_capacity(v.len());
+        for x in v {
+            if x < 0 {
+                return Err(SpatialIoError::UnsupportedFormat(format!(
+                    "negative value in {path}"
+                )));
+            }
+            out.push(x as u32);
+        }
+        return Ok(out);
+    }
+    if let Ok(v) = ds.read_raw::<i64>() {
+        let mut out = Vec::with_capacity(v.len());
+        for x in v {
+            if x < 0 || x > u32::MAX as i64 {
+                return Err(SpatialIoError::UnsupportedFormat(format!(
+                    "value out of u32 range in {path}"
+                )));
+            }
+            out.push(x as u32);
+        }
+        return Ok(out);
+    }
+    let len_guess = ds.shape().into_iter().product::<usize>();
+    if let Ok(v) = ds.read_slice_1d::<u32, _>(s![..len_guess]) {
+        return Ok(v.to_vec());
+    }
     Err(SpatialIoError::UnsupportedFormat(format!(
-        "gene not found in /features/name: {}",
-        gene_name
-    )))
-}
-
-fn parse_h5dump_feature_line(line: &str) -> Option<(usize, String)> {
-    let start = line.find('(')?;
-    let end = line[start + 1..].find(')')? + start + 1;
-    let idx = line[start + 1..end].trim().parse::<usize>().ok()?;
-
-    let quote_start = line[end..].find('"')? + end + 1;
-    let rest = &line[quote_start..];
-    let quote_end = rest.find('"')?;
-    let mut value = rest[..quote_end].to_string();
-
-    if let Some(null_pos) = value.find("\\000") {
-        value.truncate(null_pos);
-    }
-
-    Some((idx, value))
-}
-
-fn read_u32_dataset_with_fallback(
-    ds: &hdf5::Dataset,
-    h5_path: &Path,
-    dataset_path: &str,
-) -> Result<Vec<u32>, SpatialIoError> {
-    if let Ok(vals) = ds.read_raw::<u32>() {
-        return Ok(vals);
-    }
-
-    let out = Command::new("h5dump")
-        .arg("-d")
-        .arg(dataset_path)
-        .arg(h5_path)
-        .output()
-        .map_err(|e| {
-            SpatialIoError::UnsupportedFormat(format!(
-                "failed to run h5dump for {}: {e}",
-                dataset_path
-            ))
-        })?;
-
-    if !out.status.success() {
-        return Err(SpatialIoError::UnsupportedFormat(format!(
-            "h5dump failed reading {}",
-            dataset_path
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut values = Vec::<u32>::new();
-    for line in stdout.lines() {
-        let Some(colon) = line.find(':') else {
-            continue;
-        };
-        let payload = &line[colon + 1..];
-        for token in payload.split(|ch: char| !ch.is_ascii_digit()) {
-            if token.is_empty() {
-                continue;
-            }
-            values.push(token.parse::<u32>().map_err(|_| {
-                SpatialIoError::UnsupportedFormat(format!(
-                    "invalid numeric token in h5dump output for {}",
-                    dataset_path
-                ))
-            })?);
-        }
-    }
-
-    if values.is_empty() {
-        return Err(SpatialIoError::UnsupportedFormat(format!(
-            "no values parsed from h5dump output for {}",
-            dataset_path
-        )));
-    }
-
-    Ok(values)
-}
-
-fn read_string_dataset_any(ds: &hdf5::Dataset, path: &str) -> Result<Vec<String>, SpatialIoError> {
-    if let Ok(vals) = ds.read_raw::<hdf5::types::VarLenUnicode>() {
-        return Ok(vals.into_iter().map(|v| v.to_string()).collect());
-    }
-    if let Ok(vals) = ds.read_raw::<hdf5::types::VarLenAscii>() {
-        return Ok(vals.into_iter().map(|v| v.to_string()).collect());
-    }
-
-    macro_rules! try_fixed_ascii {
-        ($n:expr) => {
-            if let Ok(vals) = ds.read_raw::<hdf5::types::FixedAscii<$n>>() {
-                return Ok(vals
-                    .into_iter()
-                    .map(|v| v.as_str().trim_matches(char::from(0)).to_string())
-                    .collect());
-            }
-            if let Ok(vals) = ds.read_raw::<hdf5::types::FixedUnicode<$n>>() {
-                return Ok(vals
-                    .into_iter()
-                    .map(|v| v.as_str().trim_matches(char::from(0)).to_string())
-                    .collect());
-            }
-            if let Ok(vals) = ds.read_raw::<[u8; $n]>() {
-                return Ok(vals
-                    .into_iter()
-                    .map(|buf| {
-                        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                        String::from_utf8_lossy(&buf[..end]).trim().to_string()
-                    })
-                    .collect());
-            }
-        };
-    }
-    try_fixed_ascii!(32);
-    try_fixed_ascii!(64);
-    try_fixed_ascii!(96);
-    try_fixed_ascii!(128);
-    try_fixed_ascii!(192);
-    try_fixed_ascii!(256);
-    try_fixed_ascii!(384);
-    try_fixed_ascii!(512);
-    try_fixed_ascii!(1024);
-
-    Err(SpatialIoError::UnsupportedFormat(format!(
-        "unsupported string dataset type at {}",
-        path
+        "unsupported dtype in {path}"
     )))
 }
