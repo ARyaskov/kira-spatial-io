@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use hdf5::File;
-use ndarray::s;
 
 use crate::config::LoadConfig;
 use crate::determinism::sort::sort_bins;
@@ -180,7 +179,7 @@ fn read_u32_dataset(ds: &hdf5::Dataset, path: &str) -> Result<Vec<u32>, SpatialI
         return Ok(out);
     }
     let len_guess = ds.shape().into_iter().product::<usize>();
-    if let Ok(v) = ds.read_slice_1d::<u32, _>(s![..len_guess]) {
+    if let Ok(v) = ds.read_slice_1d::<u32, _>(..len_guess) {
         return Ok(v.to_vec());
     }
     Err(SpatialIoError::UnsupportedFormat(format!(

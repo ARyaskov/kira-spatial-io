@@ -1,6 +1,6 @@
 [package]
 name = "kira-spatial-io"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -22,7 +22,7 @@ categories = [
 [features]
 default = ["hdf5", "parallel"]
 parallel = ["dep:rayon"]
-hdf5 = ["dep:hdf5", "dep:hdf5-sys", "dep:ndarray"]
+hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 parquet = ["dep:arrow2", "dep:parquet2"]
 compression = ["dep:zstd"]
 
@@ -39,7 +39,6 @@ flate2 = "1.1"
 memmap2 = "0.9"
 hdf5 = { package = "hdf5-metno", version = "0.12", optional = true }
 hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", features = ["static", "zlib"], optional = true }
-ndarray = { version = "0.17", optional = true }
 arrow2 = { version = "0.18", optional = true, default-features = false, features = ["io_parquet", "io_parquet_compression"] }
 parquet2 = { version = "0.17", optional = true }
 zstd = { version = "0.13", optional = true }

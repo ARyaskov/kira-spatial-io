@@ -3,7 +3,6 @@
 use std::mem::size_of;
 
 use hdf5::Dataset;
-use ndarray::s;
 
 use crate::config::{DuplicatePolicy, LoadConfig};
 use crate::determinism::float::{ensure_f32_finite, ensure_f32_finite_nonneg};
@@ -381,10 +380,10 @@ fn read_u32_like_slice(
 ) -> Result<Vec<u32>, SpatialIoError> {
     let len = end - start;
 
-    if let Ok(v) = ds.read_slice_1d::<u32, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<u32, _>(start..end) {
         return Ok(v.to_vec());
     }
-    if let Ok(v) = ds.read_slice_1d::<u64, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<u64, _>(start..end) {
         let mut out = Vec::with_capacity(len);
         for x in v.iter() {
             if *x > u32::MAX as u64 {
@@ -396,7 +395,7 @@ fn read_u32_like_slice(
         }
         return Ok(out);
     }
-    if let Ok(v) = ds.read_slice_1d::<i32, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<i32, _>(start..end) {
         let mut out = Vec::with_capacity(len);
         for x in v.iter() {
             if *x < 0 {
@@ -408,7 +407,7 @@ fn read_u32_like_slice(
         }
         return Ok(out);
     }
-    if let Ok(v) = ds.read_slice_1d::<i64, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<i64, _>(start..end) {
         let mut out = Vec::with_capacity(len);
         for x in v.iter() {
             if *x < 0 || *x > u32::MAX as i64 {
@@ -434,10 +433,10 @@ fn read_f32_like_slice(
 ) -> Result<Vec<f32>, SpatialIoError> {
     let len = end - start;
 
-    if let Ok(v) = ds.read_slice_1d::<f32, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<f32, _>(start..end) {
         return Ok(v.to_vec());
     }
-    if let Ok(v) = ds.read_slice_1d::<f64, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<f64, _>(start..end) {
         let mut out = Vec::with_capacity(len);
         for x in v.iter() {
             let f = *x as f32;
@@ -446,7 +445,7 @@ fn read_f32_like_slice(
         }
         return Ok(out);
     }
-    if let Ok(v) = ds.read_slice_1d::<i32, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<i32, _>(start..end) {
         let mut out = Vec::with_capacity(len);
         for x in v.iter() {
             let f = *x as f32;
@@ -455,7 +454,7 @@ fn read_f32_like_slice(
         }
         return Ok(out);
     }
-    if let Ok(v) = ds.read_slice_1d::<u32, _>(s![start..end]) {
+    if let Ok(v) = ds.read_slice_1d::<u32, _>(start..end) {
         let mut out = Vec::with_capacity(len);
         for x in v.iter() {
             let f = *x as f32;
